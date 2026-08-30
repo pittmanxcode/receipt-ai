@@ -119,6 +119,28 @@ def register(email: str) -> None:
     set_env("KEEP_ACCOUNTS", ",".join(listed))
 
 
+def migrate_legacy() -> None:
+    """Move the single-account keys onto the account they belong to.
+
+    sync.py stops honouring EMAIL / GOOGLE_KEEP_TOKEN as soon as KEEP_ACCOUNTS
+    exists, so registering a second account without doing this first would
+    orphan a perfectly good token. EMAIL must already name the account that
+    token actually opens -- run  python sync.py --check  if unsure.
+    """
+    if env("KEEP_ACCOUNTS").strip():
+        return
+    legacy_email = env("EMAIL").strip()
+    legacy_token = env("GOOGLE_KEEP_TOKEN").strip()
+    if not legacy_email or not legacy_token:
+        return
+    set_env(f"KEEP_TOKEN_{slug(legacy_email)}", legacy_token)
+    device = env("KEEP_DEVICE_ID").strip()
+    if device:
+        set_env(f"KEEP_DEVICE_ID_{slug(legacy_email)}", device)
+    register(legacy_email)
+    print(f"  kept the existing token, now filed under {legacy_email}")
+
+
 def choose_account() -> str:
     """Which Google account this run authenticates.
 
@@ -231,6 +253,7 @@ def explain_failure() -> int:
 
 
 def main() -> int:
+    migrate_legacy()
     email = choose_account()
     print(f"\nSetting up Keep access for {email}")
     print("Sign in to THIS account in the browser -- not whichever one is already open.")
