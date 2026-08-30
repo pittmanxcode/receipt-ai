@@ -41,6 +41,7 @@ TITLE_LIMIT = 200        # keep inbox rows scannable
 BLOCK_TEXT_LIMIT = 1900  # Notion caps a rich_text run at 2000
 BLOCKS_PER_REQUEST = 100
 STOP_AFTER_FAILURES = 3  # a systematic fault should report once, not 342 times
+BULK_CONFIRM = 25        # above this, a run stops and asks rather than flooding
 
 
 def env(name: str, default: str = "") -> str:
@@ -281,16 +282,12 @@ def create_row(client, node) -> str:
 # -- run ------------------------------------------------------------------
 
 
-def sync_account(email, client, state, args, budget) -> tuple[int, int, int]:
-    keep = open_keep(email)
-    if keep is None:
-        return 0, 0, 1
-
+def sync_account(email, nodes, client, state, args, budget) -> tuple[int, int, int]:
     synced = state["notes"]
     created = skipped_edited = failed = 0
     consecutive = 0
 
-    for node in selected_notes(keep, args.since):
+    for node in nodes:
         if budget is not None and budget[0] <= 0:
             break
 
@@ -447,6 +444,31 @@ def run(args) -> int:
         log("no accounts configured; set KEEP_ACCOUNTS in .env and run auth_setup.py")
         return 1
 
+    state = load_state()
+    budget = [args.limit] if args.limit is not None else None
+    created = skipped = failed = 0
+
+    # Work out the whole plan before writing anything, so the size of the run
+    # is known while it can still be stopped.
+    plans = []
+    pending = 0
+    for email in emails:
+        keep = open_keep(email)
+        if keep is None:
+            failed += 1
+            continue
+        nodes = selected_notes(keep, args.since)
+        fresh = [n for n in nodes if f"{email}::{n.id}" not in state["notes"]]
+        plans.append((email, nodes))
+        pending += len(fresh)
+
+    if not args.dry_run and not args.yes and pending > BULK_CONFIRM:
+        log(f"this run would create {pending} rows, over the safety limit of {BULK_CONFIRM}")
+        log("  look at them first:  python sync.py --dry-run")
+        log("  go ahead anyway:     python sync.py --yes")
+        log("nothing was written")
+        return 1
+
     client = None
     if not args.dry_run:
         from notion_client import Client
@@ -457,12 +479,8 @@ def run(args) -> int:
             return 1
         client = Client(auth=notion_token)
 
-    state = load_state()
-    budget = [args.limit] if args.limit is not None else None
-    created = skipped = failed = 0
-
-    for email in emails:
-        got, skip, fail = sync_account(email, client, state, args, budget)
+    for email, nodes in plans:
+        got, skip, fail = sync_account(email, nodes, client, state, args, budget)
         created, skipped, failed = created + got, skipped + skip, failed + fail
 
     verb = "would create" if args.dry_run else "created"
@@ -496,6 +514,11 @@ def parse_args(argv=None):
         help="report what would be created; contact Notion not at all",
     )
     parser.add_argument("--limit", type=int, help="create at most N rows this run, then stop")
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help=f"go ahead even when more than {BULK_CONFIRM} rows would be created",
+    )
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
         "--since",

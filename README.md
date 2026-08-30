@@ -82,6 +82,18 @@ python sync.py             # create the rows
 python sync.py             # run again: creates zero duplicates
 ```
 
+**A run that would create more than 25 rows stops and asks.** It prints the
+count and writes nothing; look with `--dry-run`, then `--yes` to proceed.
+
+**Pulling an update:** `git checkout <ref> -- sync.py` reads your *local* copy
+of that ref, which only moves when you fetch. Always fetch first, or you will
+silently re-check-out an old file:
+
+```sh
+git fetch bridge claude/google-keep-bridge-xhc8u3
+git checkout bridge/claude/google-keep-bridge-xhc8u3 -- sync.py auth_setup.py README.md
+```
+
 **Today's notes only, no backlog.** A plain run considers notes edited in the
 last 24 hours across every configured account. It is a rolling window rather
 than "since midnight" on purpose: a note written at 23:58 would otherwise fall
