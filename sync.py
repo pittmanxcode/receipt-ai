@@ -18,9 +18,11 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import html
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -35,6 +37,14 @@ LOCK_PATH = HERE / ".sync.lock"
 # The one database this bridge may write to. Nothing else is ever touched.
 DATA_SOURCE_ID = "0cb32494-0d57-4039-bb1d-1a6c5ed66fc1"
 DATABASE_ID = "1eb54765d75c46cd8075a0c03f85b9a3"
+
+# Every capture source, and the Source value its rows carry in Notion.
+SOURCE_LABELS = {"keep": "Keep", "applenotes": "Apple Notes"}
+APPLENOTES_SCRIPT = "applenotes_probe.js"
+# Folders never captured. The JXA filters these too; this is the second line
+# of defence, since the folder name is localized on a non-English Mac and a
+# deleted note reaching the Inbox is worse than one missed.
+APPLENOTES_SKIP_FOLDERS = {"recently deleted", "deleted", "trash"}
 
 DEFAULT_WINDOW_HOURS = 24
 TITLE_LIMIT = 200        # keep inbox rows scannable
@@ -101,6 +111,22 @@ def credentials(email: str) -> tuple[str, str | None]:
     return token, (device or None)
 
 
+class Item:
+    """One capturable note, whatever produced it."""
+
+    def __init__(self, source: str, uid: str, title: str, text: str, updated, origin: str = ""):
+        self.source = source
+        self.uid = uid          # already namespaced by source; the state key
+        self.title = title
+        self.text = text
+        self.updated = updated
+        self.origin = origin    # account or folder, for the log line
+
+    @property
+    def label(self) -> str:
+        return SOURCE_LABELS[self.source]
+
+
 def log(message: str) -> None:
     stamp = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
     line = f"{stamp}  {message}"
@@ -114,7 +140,7 @@ def log(message: str) -> None:
 
 def load_state() -> dict:
     if not STATE_PATH.exists():
-        return {"version": 2, "notes": {}}
+        return {"version": 3, "notes": {}}
     try:
         data = json.loads(STATE_PATH.read_text())
     except (OSError, json.JSONDecodeError):
@@ -123,11 +149,15 @@ def load_state() -> dict:
         raise SystemExit(1)
     data.setdefault("notes", {})
     if data.get("version") == 1:
-        # v1 keyed by bare Keep note id; v2 prefixes the account so two
-        # accounts can never collide on an id.
+        # v1 keyed by bare Keep note id; v2 prefixed the account so two
+        # accounts could not collide on an id.
         primary = (accounts() or [""])[0]
         data["notes"] = {f"{primary}::{k}": v for k, v in data["notes"].items()}
         data["version"] = 2
+    if data.get("version") == 2:
+        # v3 prefixes the source, now that Keep is not the only one.
+        data["notes"] = {f"keep::{k}": v for k, v in data["notes"].items()}
+        data["version"] = 3
     return data
 
 
@@ -186,7 +216,7 @@ def note_title(node) -> str:
     return title[:TITLE_LIMIT]
 
 
-def selected_notes(keep, since) -> list:
+def _keep_notes(keep, since) -> list:
     """Non-trashed notes newer than `since`, optionally narrowed to a label."""
     label_name = env("KEEP_LABEL").strip()
     label = keep.findLabel(label_name) if label_name else None
@@ -206,6 +236,133 @@ def selected_notes(keep, since) -> list:
                 continue
         notes.append(node)
     return notes
+
+
+def keep_items(since) -> tuple[list, int]:
+    """Every Keep note newer than `since`, across all configured accounts."""
+    items, problems = [], 0
+    for email in accounts():
+        keep = open_keep(email)
+        if keep is None:
+            problems += 1
+            continue
+        for node in _keep_notes(keep, since):
+            items.append(
+                Item(
+                    source="keep",
+                    uid=f"keep::{email}::{node.id}",
+                    title=note_title(node),
+                    text=node.text or "",
+                    updated=note_updated(node),
+                    origin=email,
+                )
+            )
+    return items, problems
+
+
+# -- Apple Notes ----------------------------------------------------------
+
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _plain(text: str) -> str:
+    """Fall back to stripping HTML when `plaintext` was unavailable."""
+    if "<" not in text:
+        return text
+    text = re.sub(r"<(br|/p|/div|/h[1-6])[^>]*>", "\n", text, flags=re.I)
+    return html.unescape(_TAG_RE.sub("", text)).strip()
+
+
+def applenotes_items(since) -> tuple[list, int]:
+    """Apple Notes modified since `since`, read through Notes.app scripting.
+
+    Apple exposes no file format worth parsing here, so this drives the app.
+    The first run needs the macOS automation permission granted; under launchd
+    there is nobody to click that prompt, so run it once by hand first.
+    """
+    script = HERE / APPLENOTES_SCRIPT
+    if not script.exists():
+        log(f"{script.name} is missing; cannot read Apple Notes")
+        return [], 1
+
+    hours = max((datetime.now(timezone.utc) - since).total_seconds() / 3600, 1) if since else 24 * 3650
+    try:
+        result = subprocess.run(
+            ["osascript", "-l", "JavaScript", str(script), str(hours)],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except FileNotFoundError:
+        log("osascript not found; Apple Notes capture only works on macOS")
+        return [], 1
+    except subprocess.TimeoutExpired:
+        log("Apple Notes did not answer within 5 minutes")
+        return [], 1
+
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip()
+        log(f"could not read Apple Notes: {detail[:300]}")
+        if "-1743" in detail or "not authorized" in detail.lower():
+            log(
+                "    macOS has not granted automation access. Run this once from "
+                "Terminal and approve the prompt:  python sync.py --source applenotes --dry-run"
+            )
+            log("    then check System Settings -> Privacy & Security -> Automation.")
+        return [], 1
+
+    try:
+        rows = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError:
+        log("Apple Notes returned something that is not JSON; skipping this run")
+        return [], 1
+
+    items, skipped_folders = [], 0
+    for row in rows:
+        folder = (row.get("folder") or "").strip()
+        extra = env("APPLENOTES_SKIP_FOLDERS")
+        deny = APPLENOTES_SKIP_FOLDERS | {
+            f.strip().lower() for f in extra.split(",") if f.strip()
+        }
+        if folder.lower() in deny:
+            skipped_folders += 1
+            continue
+        text = _plain(row.get("text") or "")
+        title = (row.get("name") or "").strip() or next(
+            (line.strip() for line in text.splitlines() if line.strip()), ""
+        )
+        updated = None
+        stamp = row.get("modified")
+        if stamp:
+            try:
+                updated = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+            except ValueError:
+                updated = None
+        if not title:
+            when = updated or datetime.now(timezone.utc)
+            title = f"Apple note {when.astimezone():%Y-%m-%d %H:%M}"
+        items.append(
+            Item(
+                source="applenotes",
+                uid=f"applenotes::{row.get('id')}",
+                title=title[:TITLE_LIMIT],
+                text=text,
+                updated=updated,
+                origin=folder,
+            )
+        )
+    if skipped_folders:
+        log(f"Apple Notes: skipped {skipped_folders} note(s) in excluded folders")
+    return items, 0
+
+
+def gather(sources, since) -> tuple[list, int]:
+    items, problems = [], 0
+    for name in sources:
+        got, bad = (keep_items if name == "keep" else applenotes_items)(since)
+        items += got
+        problems += bad
+    return items, problems
 
 
 # -- Notion ---------------------------------------------------------------
@@ -243,11 +400,11 @@ def describe(exc: Exception) -> str:
     return " | ".join(parts)
 
 
-def create_row(client, node) -> str:
-    blocks = text_blocks(node.text)
+def create_row(client, item) -> str:
+    blocks = text_blocks(item.text)
     properties = {
-        "Note": {"title": [{"type": "text", "text": {"content": note_title(node)}}]},
-        "Source": {"select": {"name": "Keep"}},
+        "Note": {"title": [{"type": "text", "text": {"content": item.title}}]},
+        "Source": {"select": {"name": item.label}},
         "Status": {"select": {"name": "Unfiled"}},
         # Section, Actionable and Confidence stay empty -- the sweep fills those.
     }
@@ -282,59 +439,58 @@ def create_row(client, node) -> str:
 # -- run ------------------------------------------------------------------
 
 
-def sync_account(email, nodes, client, state, args, budget) -> tuple[int, int, int]:
+def sync_items(items, client, state, args, budget) -> tuple[int, int, int]:
     synced = state["notes"]
     created = skipped_edited = failed = 0
     consecutive = 0
 
-    for node in nodes:
+    for item in items:
         if budget is not None and budget[0] <= 0:
             break
 
-        key = f"{email}::{node.id}"
-        updated = note_updated(node)
-        updated_iso = updated.isoformat() if updated else ""
+        where = f"{item.source}/{item.origin}" if item.origin else item.source
+        updated_iso = item.updated.isoformat() if item.updated else ""
 
-        record = synced.get(key)
+        record = synced.get(item.uid)
         if record:
-            if updated_iso and record.get("keep_updated") and updated_iso > record["keep_updated"]:
-                log(f"{email}: edited after it synced, skipped (v1 limitation): {note_title(node)!r}")
+            if updated_iso and record.get("updated") and updated_iso > record["updated"]:
+                log(f"{where}: edited after it synced, skipped (v1 limitation): {item.title!r}")
                 skipped_edited += 1
             continue
 
         if args.dry_run:
-            log(f"{email}: would create row for {note_title(node)!r}")
+            log(f"{where}: would create row for {item.title!r}")
             created += 1
             if budget is not None:
                 budget[0] -= 1
             continue
 
         try:
-            page_id = create_row(client, node)
+            page_id = create_row(client, item)
         except Exception as exc:
             failed += 1
             consecutive += 1
-            log(f"{email}: could not create a row for {note_title(node)!r}: {describe(exc)}")
+            log(f"{where}: could not create a row for {item.title!r}: {describe(exc)}")
             if consecutive >= STOP_AFTER_FAILURES:
                 log(
-                    f"{email}: stopping after {consecutive} failures in a row -- this is a "
+                    f"stopping after {consecutive} failures in a row -- this is a "
                     "systematic fault, not one awkward note. Fix it and run again."
                 )
                 break
             continue
 
         consecutive = 0
-        synced[key] = {
+        synced[item.uid] = {
             "notion_page_id": page_id,
-            "keep_updated": updated_iso,
+            "updated": updated_iso,
             "synced_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
-        # Saved per note: an interrupted run never re-creates what it just made.
+        # Saved per item: an interrupted run never re-creates what it just made.
         save_state(state)
         created += 1
         if budget is not None:
             budget[0] -= 1
-        log(f"{email}: created row for {note_title(node)!r}")
+        log(f"{where}: created row for {item.title!r}")
 
     return created, skipped_edited, failed
 
@@ -386,33 +542,46 @@ def undo() -> int:
     return 1 if failed else 0
 
 
-def check() -> int:
-    """Read-only preflight: which Keep account is behind each token, and can
-    Notion actually be written to.
-
-    Creates nothing. Run this after adding an account or changing Notion
-    sharing -- it answers both questions without putting a row in the Inbox.
-    """
-    emails = accounts()
-    if not emails:
-        log("no accounts configured; set KEEP_ACCOUNTS in .env")
-        return 1
-
+def check(args) -> int:
+    """Read-only preflight across every source, plus Notion. Creates nothing."""
     problems = 0
-    for email in emails:
-        keep = open_keep(email)
-        if keep is None:
+
+    if "keep" in args.sources:
+        emails = accounts()
+        if not emails:
+            log("no Keep accounts configured; set KEEP_ACCOUNTS in .env")
             problems += 1
-            continue
-        live = [n for n in keep.all() if not n.trashed]
-        recent = sorted(live, key=lambda n: note_updated(n) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
-        log(f"{email}: signed in, {len(live)} live notes")
-        for node in recent[:3]:
-            when = note_updated(node)
-            stamp = when.astimezone().strftime("%Y-%m-%d %H:%M") if when else "unknown"
-            log(f"    most recent: {stamp}  {note_title(node)!r}")
-        if not recent:
-            log("    no live notes -- check this is the account you meant")
+        for email in emails:
+            keep = open_keep(email)
+            if keep is None:
+                problems += 1
+                continue
+            live = [n for n in keep.all() if not n.trashed]
+            recent = sorted(
+                live,
+                key=lambda n: note_updated(n) or datetime.min.replace(tzinfo=timezone.utc),
+                reverse=True,
+            )
+            log(f"{email}: signed in, {len(live)} live notes")
+            for node in recent[:3]:
+                when = note_updated(node)
+                stamp = when.astimezone().strftime("%Y-%m-%d %H:%M") if when else "unknown"
+                log(f"    most recent: {stamp}  {note_title(node)!r}")
+
+    if "applenotes" in args.sources:
+        items, bad = applenotes_items(args.since)
+        problems += bad
+        if not bad:
+            folders = sorted({i.origin for i in items if i.origin})
+            log(f"Apple Notes: readable, {len(items)} in the window")
+            if folders:
+                log(f"    folders seen: {', '.join(folders[:8])}")
+            for item in sorted(
+                items, key=lambda i: i.updated or datetime.min.replace(tzinfo=timezone.utc),
+                reverse=True,
+            )[:3]:
+                stamp = item.updated.astimezone().strftime("%Y-%m-%d %H:%M") if item.updated else "unknown"
+                log(f"    most recent: {stamp}  {item.title!r}")
 
     notion_token = env("NOTION_TOKEN").strip()
     if not notion_token:
@@ -421,9 +590,8 @@ def check() -> int:
 
     from notion_client import Client
 
-    client = Client(auth=notion_token)
     try:
-        source = client.data_sources.retrieve(data_source_id=DATA_SOURCE_ID)
+        source = Client(auth=notion_token).data_sources.retrieve(data_source_id=DATA_SOURCE_ID)
         title = "".join(t.get("plain_text", "") for t in source.get("title", []))
         log(f"Notion: can reach the data source ({title or DATA_SOURCE_ID}) -- writes should work")
     except Exception as exc:
@@ -439,28 +607,13 @@ def check() -> int:
 
 
 def run(args) -> int:
-    emails = accounts()
-    if not emails:
-        log("no accounts configured; set KEEP_ACCOUNTS in .env and run auth_setup.py")
-        return 1
-
     state = load_state()
     budget = [args.limit] if args.limit is not None else None
-    created = skipped = failed = 0
 
-    # Work out the whole plan before writing anything, so the size of the run
-    # is known while it can still be stopped.
-    plans = []
-    pending = 0
-    for email in emails:
-        keep = open_keep(email)
-        if keep is None:
-            failed += 1
-            continue
-        nodes = selected_notes(keep, args.since)
-        fresh = [n for n in nodes if f"{email}::{n.id}" not in state["notes"]]
-        plans.append((email, nodes))
-        pending += len(fresh)
+    # Read every source before writing anything, so the size of the run is
+    # known while it can still be stopped.
+    items, failed = gather(args.sources, args.since)
+    pending = sum(1 for i in items if i.uid not in state["notes"])
 
     if not args.dry_run and not args.yes and pending > BULK_CONFIRM:
         log(f"this run would create {pending} rows, over the safety limit of {BULK_CONFIRM}")
@@ -479,16 +632,16 @@ def run(args) -> int:
             return 1
         client = Client(auth=notion_token)
 
-    for email, nodes in plans:
-        got, skip, fail = sync_account(email, nodes, client, state, args, budget)
-        created, skipped, failed = created + got, skipped + skip, failed + fail
+    created, skipped, more_failed = sync_items(items, client, state, args, budget)
+    failed += more_failed
 
     verb = "would create" if args.dry_run else "created"
+    where = "+".join(args.sources)
     if created == 0 and skipped == 0 and failed == 0:
-        log(f"no new notes across {len(emails)} account(s)")
+        log(f"no new notes ({where})")
     else:
         log(
-            f"run finished across {len(emails)} account(s): {created} {verb}, "
+            f"run finished ({where}): {created} {verb}, "
             f"{skipped} edited-skipped, {failed} failed"
         )
     return 1 if failed else 0
@@ -513,6 +666,12 @@ def parse_args(argv=None):
         action="store_true",
         help="report what would be created; contact Notion not at all",
     )
+    parser.add_argument(
+        "--source",
+        action="append",
+        choices=sorted(SOURCE_LABELS),
+        help="capture from just this source; repeatable. Default: all of them.",
+    )
     parser.add_argument("--limit", type=int, help="create at most N rows this run, then stop")
     parser.add_argument(
         "--yes",
@@ -535,6 +694,7 @@ def parse_args(argv=None):
         help=f"how far back the default window reaches (default {DEFAULT_WINDOW_HOURS}h)",
     )
     args = parser.parse_args(argv)
+    args.sources = args.source or sorted(SOURCE_LABELS)
 
     if args.all:
         args.since = None
@@ -557,7 +717,7 @@ def main() -> int:
     if args.undo:
         return undo()
     if args.check:
-        return check()
+        return check(args)
     LOCK_PATH.touch(exist_ok=True)
     handle = os.open(LOCK_PATH, os.O_RDWR)
     try:

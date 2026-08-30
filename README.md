@@ -1,10 +1,35 @@
-# Keep → Notion capture bridge
+# Capture bridge → Notion
 
-The capture leg of the daily OS. Notes spoken or typed into Google Keep land
-automatically as rows in the **📥 Notes Inbox** Notion database, with no taps.
+The capture leg of the daily OS. Notes from **Google Keep** and **Apple Notes**
+land automatically as rows in the **📥 Notes Inbox** Notion database, no taps.
 A separate system sweeps that Inbox and files them; this bridge does not.
 
-One way, Keep → Notion. This code never modifies a Keep note.
+One way, into Notion. This code never modifies a note at either source.
+
+Rows carry `Source = Keep` or `Source = Apple Notes`. Run all sources (the
+default) or one at a time with `--source keep` / `--source applenotes`.
+
+## Apple Notes
+
+Apple ships no API, but Notes.app is scriptable, so `applenotes_probe.js` reads
+it through `osascript` and hands back JSON. Notes in *Recently Deleted* are
+skipped twice over — once in the script and once in Python, because the folder
+name is localized on a non-English Mac and a deleted note reaching the Inbox is
+worse than one missed. Add more exclusions with `APPLENOTES_SKIP_FOLDERS` in
+`.env` (comma-separated folder names).
+
+**The automation permission is the thing that breaks this.** The first time
+anything scripts Notes.app, macOS asks for approval. Under launchd there is
+nobody to click it and the call fails with error `-1743`. So grant it by hand
+first:
+
+```sh
+python sync.py --source applenotes --dry-run
+```
+
+Approve the prompt, then confirm it stuck under System Settings → Privacy &
+Security → Automation. Scripting Notes.app also launches it if it is not
+already running.
 
 ## Files
 
@@ -12,6 +37,7 @@ One way, Keep → Notion. This code never modifies a Keep note.
 | --- | --- |
 | `auth_setup.py` | one-time interactive Google auth; mints and verifies the master token |
 | `sync.py` | the scheduled run: every non-trashed Keep note becomes one Inbox row, once |
+| `applenotes_probe.js` | reads Apple Notes via Notes.app scripting; prints JSON |
 | `com.michael.keepbridge.plist` | LaunchAgent that runs `sync.py` every 15 minutes |
 
 Three files, no framework. Each script reads `.env` itself rather than pulling
