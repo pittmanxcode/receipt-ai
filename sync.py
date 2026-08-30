@@ -23,12 +23,34 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-import envfile
-
 HERE = Path(__file__).resolve().parent
+ENV_PATH = HERE / ".env"
 STATE_PATH = HERE / ".sync_state.json"
 LOG_PATH = HERE / "sync.log"
 LOCK_PATH = HERE / ".sync.lock"
+
+
+def env(name: str, default: str = "") -> str:
+    """Environment first, then .env -- launchd passes little of the shell in.
+
+    Read-only: this script never writes a credential back.
+    """
+    if os.environ.get(name):
+        return os.environ[name]
+    if not ENV_PATH.exists():
+        return default
+    for raw in ENV_PATH.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        if key.strip() != name:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        return value
+    return default
 
 # The one database this bridge is allowed to write to. Nothing else in the
 # workspace is ever touched.
@@ -85,9 +107,9 @@ def save_state(state: dict) -> None:
 def open_keep():
     import gkeepapi
 
-    email = envfile.get("EMAIL").strip()
-    token = envfile.get("GOOGLE_KEEP_TOKEN").strip()
-    android_id = envfile.get("KEEP_DEVICE_ID").strip() or None
+    email = env("EMAIL").strip()
+    token = env("GOOGLE_KEEP_TOKEN").strip()
+    android_id = env("KEEP_DEVICE_ID").strip() or None
 
     if not email or not token:
         log("EMAIL or GOOGLE_KEEP_TOKEN missing from .env; run auth_setup.py")
@@ -121,7 +143,7 @@ def selected_notes(keep) -> list:
     KEEP_LABEL is the safety valve: unset means every live note is captured,
     which is what full capture requires; set it to stage a smaller first run.
     """
-    label_name = envfile.get("KEEP_LABEL").strip()
+    label_name = env("KEEP_LABEL").strip()
     label = keep.findLabel(label_name) if label_name else None
     if label_name and label is None:
         log(f"KEEP_LABEL {label_name!r} does not exist in Keep; nothing to do")
@@ -199,7 +221,7 @@ def create_row(client, node) -> str:
 def run() -> int:
     from notion_client import Client
 
-    notion_token = envfile.get("NOTION_TOKEN").strip()
+    notion_token = env("NOTION_TOKEN").strip()
     if not notion_token:
         log("NOTION_TOKEN missing from .env")
         return 1

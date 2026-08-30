@@ -13,7 +13,9 @@ One way, Keep → Notion. This code never modifies a Keep note.
 | `auth_setup.py` | one-time interactive Google auth; mints and verifies the master token |
 | `sync.py` | the scheduled run: every non-trashed Keep note becomes one Inbox row, once |
 | `com.michael.keepbridge.plist` | LaunchAgent that runs `sync.py` every 15 minutes |
-| `envfile.py` | ~60-line `.env` reader/writer so neither script needs `python-dotenv` |
+
+Three files, no framework. Each script reads `.env` itself rather than pulling
+in `python-dotenv`.
 
 ## Setup
 
@@ -25,7 +27,7 @@ NOTION_TOKEN=...               # integration "google keep bridge"
 NOTION_PARENT_PAGE_ID=3cb540deb7fe81d2a25eebd078e5360f
 GOOGLE_KEEP_TOKEN=             # auth_setup.py fills this in
 KEEP_DEVICE_ID=                # auth_setup.py fills this in
-KEEP_LABEL=                    # optional: restrict to one Keep label
+KEEP_LABEL=                    # leave empty: every non-trashed note is captured
 ```
 
 ### 1. Authenticate (once)
@@ -85,6 +87,9 @@ launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.michael.keepbridge.plist
 
 ## Scope and safety
 
+- **Every non-trashed Keep note is captured.** `KEEP_LABEL` can narrow a first
+  run to one label, but empty is the intended setting: failing to capture is
+  the failure mode that matters.
 - **Writes touch only** data source `0cb32494-0d57-4039-bb1d-1a6c5ed66fc1`
   (📥 Notes Inbox). No other Notion page is ever written.
 - **Keep is read-only.** No attribute is set on a note and nothing is pushed back.

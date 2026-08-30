@@ -12,10 +12,65 @@ does not land in shell history or the process list.
 
 from __future__ import annotations
 
+import os
 import secrets
 import sys
+import tempfile
+from pathlib import Path
 
-import envfile
+ENV_PATH = Path(__file__).resolve().parent / ".env"
+
+
+def _read_env() -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not ENV_PATH.exists():
+        return values
+    for raw in ENV_PATH.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        values[key.strip()] = value
+    return values
+
+
+def env(name: str, default: str = "") -> str:
+    return os.environ.get(name) or _read_env().get(name, default)
+
+
+def set_env(name: str, value: str) -> None:
+    """Rewrite one key in place, preserving the rest of the file.
+
+    Temp-file-and-rename, so an interrupted write cannot leave a truncated
+    .env holding half a credential.
+    """
+    lines = ENV_PATH.read_text().splitlines() if ENV_PATH.exists() else []
+    replaced = False
+    for index, raw in enumerate(lines):
+        stripped = raw.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            if stripped.partition("=")[0].strip() == name:
+                lines[index] = f"{name}={value}"
+                replaced = True
+                break
+    if not replaced:
+        lines.append(f"{name}={value}")
+
+    handle, tmp_name = tempfile.mkstemp(dir=ENV_PATH.parent, prefix=".env.", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(handle, "w") as fh:
+            fh.write("\n".join(lines) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, ENV_PATH)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 BROWSER_STEPS = """
 Get a fresh code first -- it is single-use and expires within minutes:
@@ -38,17 +93,17 @@ def device_id() -> str:
     on every later sign-in. Generating a new one silently would invalidate a
     working token.
     """
-    existing = envfile.get("KEEP_DEVICE_ID").strip()
+    existing = env("KEEP_DEVICE_ID").strip()
     if existing:
         return existing
     generated = secrets.token_hex(8)
-    envfile.set_value("KEEP_DEVICE_ID", generated)
+    set_env("KEEP_DEVICE_ID", generated)
     print(f"  generated a device id and saved it to .env: {generated}")
     return generated
 
 
 def prompt_for_code() -> str:
-    print(BROWSER_STEPS.format(email=envfile.get("EMAIL") or "your account"))
+    print(BROWSER_STEPS.format(email=env("EMAIL") or "your account"))
     try:
         code = input("Paste the oauth_token cookie value: ").strip()
     except (EOFError, KeyboardInterrupt):
@@ -130,7 +185,7 @@ def explain_failure() -> int:
 
 
 def main() -> int:
-    email = envfile.get("EMAIL").strip()
+    email = env("EMAIL").strip()
     if not email:
         print("EMAIL is not set in .env. Add it and run again.")
         return 1
@@ -141,7 +196,7 @@ def main() -> int:
     token = exchange(email, code, android_id)
     note_count = verify(email, token, android_id)
 
-    envfile.set_value("GOOGLE_KEEP_TOKEN", token)
+    set_env("GOOGLE_KEEP_TOKEN", token)
     print(
         f"\nDone. Signed in and saw {note_count} notes.\n"
         f"  The master token is saved in .env as GOOGLE_KEEP_TOKEN (file mode 600).\n"
