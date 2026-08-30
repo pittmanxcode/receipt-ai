@@ -22,19 +22,28 @@ in `python-dotenv`.
 `.env` holds everything and is never committed:
 
 ```
-EMAIL=...                      # the Google account
-NOTION_TOKEN=...               # integration "google keep bridge"
-NOTION_PARENT_PAGE_ID=3cb540deb7fe81d2a25eebd078e5360f
-GOOGLE_KEEP_TOKEN=             # auth_setup.py fills this in
-KEEP_DEVICE_ID=                # auth_setup.py fills this in
-KEEP_LABEL=                    # leave empty: every non-trashed note is captured
+KEEP_ACCOUNTS=a@gmail.com,b@icloud.com   # every Keep account to sync
+KEEP_TOKEN_A_GMAIL_COM=                  # auth_setup.py fills these in,
+KEEP_DEVICE_ID_A_GMAIL_COM=              #   one pair per account
+NOTION_TOKEN=...                         # integration "google keep bridge"
+KEEP_WINDOW_HOURS=24                     # optional: how far back a run looks
+KEEP_LABEL=                              # optional: restrict to one Keep label
 ```
 
-### 1. Authenticate (once)
+A single-account `.env` using `EMAIL` / `GOOGLE_KEEP_TOKEN` / `KEEP_DEVICE_ID`
+still works unchanged — that account is treated as the first entry and its
+existing token is reused, so there is no need to re-authenticate it.
+
+### 1. Authenticate (once per account)
 
 ```sh
-python3 auth_setup.py
+python auth_setup.py     # run again for each additional account
 ```
+
+It lists the accounts already in `.env`, asks which one you are setting up,
+and stores that account's token and device id under its own keys. Each account
+needs its own browser sign-in — **sign in to the account you typed**, not
+whichever Google account the browser already has open.
 
 It walks you through getting an `oauth_token` cookie from
 <https://accounts.google.com/EmbeddedSetup>, exchanges it for a master token,
@@ -52,22 +61,29 @@ master token to it.
 ### 2. First sync
 
 ```sh
-python3 sync.py --dry-run          # see what would be created, write nothing
-python3 sync.py --since 2026-08-29 # just recent notes, to prove the pipe
-python3 sync.py                    # everything
-python3 sync.py                    # run again: creates zero duplicates
+python sync.py --dry-run   # see what would be created, contact Notion not at all
+python sync.py             # create the rows
+python sync.py             # run again: creates zero duplicates
 ```
 
-`--dry-run` writes nothing to Notion and nothing to state. `--limit N` stops
-after N rows. `--since YYYY-MM-DD` takes only notes edited in Keep on or after
-that date. launchd runs `sync.py` with no arguments, so scheduled behaviour is
-unaffected by any of them.
+**Today's notes only, no backlog.** A plain run considers notes edited in the
+last 24 hours across every configured account. It is a rolling window rather
+than "since midnight" on purpose: a note written at 23:58 would otherwise fall
+outside the window by the time the next 15-minute run fires, and never be
+captured. Duplicates are impossible regardless, because state is keyed by
+account and Keep note id.
 
-**Before a first run against a back catalogue:** `Captured` in the Notes Inbox
-is a Notion `created_time` — it records when the *row* was made, not when the
-note was written, and nothing can set it. So importing an old note stamps it
-with today. Stage the backlog with `--since` or `--limit` if that matters to
-how the sweep files things.
+Older notes stay in Keep. `--since YYYY-MM-DD` reaches further back and
+`--all` takes everything; `--limit N` caps a run. launchd runs `sync.py` with
+no arguments, so the schedule always gets the rolling window.
+
+**Why no backlog by default:** `Captured` in the Notes Inbox is a Notion
+`created_time` — it records when the *row* was made, not when the note was
+written, and nothing can set it. Importing a year of old notes would stamp
+them all as captured today, and the sweep files by that.
+
+If a run fails the same way three times running, it stops and says so rather
+than repeating one systematic fault once per note.
 
 Dedupe is by Keep note id in `.sync_state.json`, written after **each** row, so
 an interrupted run never re-creates what it just made. A note edited in Keep

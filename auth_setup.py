@@ -13,6 +13,7 @@ does not land in shell history or the process list.
 from __future__ import annotations
 
 import os
+import re
 import secrets
 import sys
 import tempfile
@@ -86,24 +87,69 @@ Get a fresh code first -- it is single-use and expires within minutes:
 """
 
 
-def device_id() -> str:
-    """A stable 16-hex device id, generated once and kept in .env.
+def slug(email: str) -> str:
+    """A .env-safe suffix for an account, independent of ordering."""
+    return re.sub(r"[^A-Z0-9]", "_", email.strip().upper())
 
-    Google ties the master token to this id, so it has to be the same value
-    on every later sign-in. Generating a new one silently would invalidate a
-    working token.
+
+def device_id(email: str) -> str:
+    """A stable 16-hex device id per account, generated once and kept in .env.
+
+    Google ties the master token to this id, so it has to be the same value on
+    every later sign-in. Generating a new one silently would stop a working
+    token from being accepted.
     """
-    existing = env("KEEP_DEVICE_ID").strip()
+    key = f"KEEP_DEVICE_ID_{slug(email)}"
+    existing = env(key).strip()
+    if not existing and email == env("EMAIL").strip():
+        existing = env("KEEP_DEVICE_ID").strip()  # single-account .env
     if existing:
         return existing
     generated = secrets.token_hex(8)
-    set_env("KEEP_DEVICE_ID", generated)
-    print(f"  generated a device id and saved it to .env: {generated}")
+    set_env(key, generated)
+    print(f"  generated a device id for this account: {generated}")
     return generated
 
 
-def prompt_for_code() -> str:
-    print(BROWSER_STEPS.format(email=env("EMAIL") or "your account"))
+def register(email: str) -> None:
+    """Add the account to KEEP_ACCOUNTS, preserving any already there."""
+    listed = [a.strip() for a in env("KEEP_ACCOUNTS").split(",") if a.strip()]
+    if email not in listed:
+        listed.append(email)
+    set_env("KEEP_ACCOUNTS", ",".join(listed))
+
+
+def choose_account() -> str:
+    """Which Google account this run authenticates.
+
+    Each account needs its own token, so this is run once per account -- and
+    the browser sign-in must be for the same address entered here.
+    """
+    listed = [a.strip() for a in env("KEEP_ACCOUNTS").split(",") if a.strip()]
+    fallback = env("EMAIL").strip()
+    if not listed and fallback:
+        listed = [fallback]
+    if listed:
+        print("\nAccounts already in .env:")
+        for account in listed:
+            has_token = bool(env(f"KEEP_TOKEN_{slug(account)}").strip()) or (
+                account == fallback and bool(env("GOOGLE_KEEP_TOKEN").strip())
+            )
+            print(f"  {account}  {'[has a token]' if has_token else '[not set up yet]'}")
+
+    try:
+        entered = input("\nWhich Google account are you setting up? ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nStopped before an account was entered.")
+        raise SystemExit(1)
+    if not entered or "@" not in entered:
+        print("That does not look like an email address.")
+        raise SystemExit(1)
+    return entered
+
+
+def prompt_for_code(email: str) -> str:
+    print(BROWSER_STEPS.format(email=email))
     try:
         code = input("Paste the oauth_token cookie value: ").strip()
     except (EOFError, KeyboardInterrupt):
@@ -185,26 +231,34 @@ def explain_failure() -> int:
 
 
 def main() -> int:
-    email = env("EMAIL").strip()
-    if not email:
-        print("EMAIL is not set in .env. Add it and run again.")
-        return 1
+    email = choose_account()
+    print(f"\nSetting up Keep access for {email}")
+    print("Sign in to THIS account in the browser -- not whichever one is already open.")
 
-    print(f"Setting up Keep access for {email}")
-    android_id = device_id()
-    code = prompt_for_code()
+    android_id = device_id(email)
+    code = prompt_for_code(email)
     token = exchange(email, code, android_id)
     note_count = verify(email, token, android_id)
 
-    set_env("GOOGLE_KEEP_TOKEN", token)
+    set_env(f"KEEP_TOKEN_{slug(email)}", token)
+    register(email)
+
+    remaining = [
+        a.strip()
+        for a in env("KEEP_ACCOUNTS").split(",")
+        if a.strip() and not env(f"KEEP_TOKEN_{slug(a.strip())}").strip()
+    ]
     print(
-        f"\nDone. Signed in and saw {note_count} notes.\n"
-        f"  The master token is saved in .env as GOOGLE_KEEP_TOKEN (file mode 600).\n"
-        f"  The device id is saved as KEEP_DEVICE_ID -- both are needed together.\n"
-        f"  The token is long-lived; you should not need to run this again unless\n"
-        f"  it is revoked by a password change or a device sign-out.\n"
-        f"\nNext:  python3 sync.py"
+        f"\nDone. Signed in to {email} and saw {note_count} notes.\n"
+        f"  Token saved in .env as KEEP_TOKEN_{slug(email)} (file mode 600).\n"
+        f"  Device id saved as KEEP_DEVICE_ID_{slug(email)} -- both are needed together.\n"
+        f"  The token is long-lived; you should not need to run this again for this\n"
+        f"  account unless it is revoked by a password change or a device sign-out."
     )
+    if remaining:
+        print(f"\nStill to set up: {', '.join(remaining)}\n  Run this again for each.")
+    else:
+        print("\nNext:  python sync.py --dry-run")
     return 0
 
 
