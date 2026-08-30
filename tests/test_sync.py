@@ -358,3 +358,54 @@ def test_a_conflict_does_not_block_the_other_fields_on_the_same_receipt(env):
     remote = parse_note(note_for(env, receipt.id).text, receipt.id)
     assert remote.total == Decimal("99.00")  # contested: Keep keeps its own
     assert remote.category == "household"  # clean local edit still lands
+
+
+# -- first contact with a real account ------------------------------------
+
+
+def test_a_labelled_note_that_is_not_a_receipt_is_left_untouched(env):
+    # The blast-radius case: someone's real note happens to carry the label.
+    # Rewriting it into a receipt template would erase what they wrote.
+    note = env.backend.create_note("Costco", "Costco run\nmilk, eggs\npaid cash", "receipts")
+    original = env.backend.note(note.id).text
+
+    report = env.sync()
+
+    assert report.count("skipped_unrecognized") == 1
+    assert env.store.load_all() == {}
+    assert env.backend.note(note.id).text == original
+
+
+def test_unrecognized_notes_can_be_adopted_on_request(env):
+    note = env.backend.create_note("Costco", "Costco run\nmilk, eggs", "receipts")
+
+    engine = env.engine()
+    engine.adopt_unrecognized = True
+    engine.run()
+
+    (receipt,) = env.store.load_all().values()
+    # Adopting still must not lose the text it could not parse into fields.
+    assert receipt.notes == "Costco run\nmilk, eggs"
+    assert "Costco run" in env.backend.note(note.id).text
+
+
+def test_importing_a_note_never_drops_text_it_cannot_parse(env):
+    env.backend.create_note(
+        "x", "vendor: Blue Bottle\ntotal: 8.75\npaid by Dana, settle up later", "receipts"
+    )
+
+    env.sync()
+
+    (receipt,) = env.store.load_all().values()
+    assert receipt.vendor == "Blue Bottle"
+    assert receipt.notes == "paid by Dana, settle up later"
+
+
+def test_a_second_sync_of_an_imported_note_is_stable(env):
+    # Canonicalisation must be idempotent, or every run would rewrite Keep.
+    env.backend.create_note("x", "merchant: Blue Bottle\namount: $8.75\nnote to self", "receipts")
+    env.sync()
+
+    report = env.sync()
+
+    assert report.changed == 0

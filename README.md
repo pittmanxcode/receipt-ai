@@ -31,41 +31,76 @@ pip install -e '.[dev]'
 
 ## Authenticating
 
-Set the account and a master token in the environment. The token is read from
-the environment and never written to disk.
+Keep has no password or OAuth-app login here — `gkeepapi` authenticates with a
+**master token**, which is long-lived and grants full account access. Treat it
+exactly like a password.
+
+Minting one is a browser flow, because `gpsoauth.perform_master_login()` with a
+password or app password now generally returns `BadAuthentication`:
+
+1. Open <https://accounts.google.com/EmbeddedSetup> in a browser and sign in
+   fully with the account you want to sync.
+2. Accept the agreement prompt. The page may then appear to load forever —
+   that is expected; carry on.
+3. In devtools, copy the value of the **`oauth_token` cookie**. It starts with
+   `oauth2_4/` or `oauth2_1/`.
+4. Exchange it for a master token:
+
+   ```python
+   import gpsoauth
+   print(gpsoauth.exchange_token("you@gmail.com", "oauth2_4/...", "0123456789abcdef")["Token"])
+   ```
+
+   The third argument is an arbitrary but **stable** 16-hex-character device id
+   — reuse the same one, since Google ties the token to it.
+
+The result starts with `aas_et/`. Put it in the environment; nothing writes it
+to disk:
 
 ```sh
 export KEEP_EMAIL='you@gmail.com'
 export KEEP_MASTER_TOKEN='aas_et/...'
 ```
 
-To mint a master token, exchange an OAuth token for one with `gpsoauth`
-(installed as a `gkeepapi` dependency). The usual route is to sign in on a
-browser to Google's embedded setup endpoint, copy the resulting `oauth_token`,
-and exchange it:
+The token does not expire on a schedule, but it is revoked by a password
+change, by signing the "device" out from your Google account's device list, and
+sometimes by Google on its own. When that happens `keep-bridge` fails with a
+message telling you to mint a new one rather than retrying a dead token.
 
-```python
-import gpsoauth
-print(gpsoauth.exchange_token('you@gmail.com', 'oauth2rt_...', 'any-device-id')['Token'])
-```
+## Going to production
 
-A master token is **long-lived and account-wide** — treat it like a password.
-Revoke it from your Google account's device list when you are done.
-
-## Use
+Run these in order the first time against a real account. The first two write
+nothing at all.
 
 ```sh
-keep-bridge add "Blue Bottle" '$8.75' --date 3/2/2026 --category coffee --tag work
-keep-bridge sync --dry-run -v     # show what would move, write nothing
-keep-bridge sync                  # do it
-keep-bridge status
+keep-bridge check                 # 1. read-only: proves auth, shows blast radius
+keep-bridge sync --dry-run -v     # 2. exactly what would move, still no writes
+keep-bridge sync                  # 3. for real
 ```
 
-`keep-bridge sync --offline --dry-run` runs the whole engine against an empty
-in-memory Keep — useful for validating local records with no credentials.
+`check` reports how many notes under the label are already linked, how many
+would be imported, and how many are **not receipt-shaped** and will be left
+untouched. Read that last number before step 3.
 
-Only notes carrying the `receipts` label are touched; nothing else in your Keep
-account is read or written. Change it with `--label`.
+Safety properties worth knowing:
+
+- **A labelled note that shows no receipt fields is never touched.** Importing
+  it would rewrite someone's text into a receipt template. `--adopt-unrecognized`
+  overrides this; its text is preserved in the `Notes:` section either way.
+- **Nothing that cannot be parsed is discarded.** Unrecognised lines land in
+  `Notes:`, so a round-trip through Keep never erases text.
+- **Writes are crash-safe.** The ledger and every receipt file are written to a
+  temp file and renamed, so an interrupted run cannot truncate the merge base.
+- **One run at a time.** A lock file in the state dir makes a second concurrent
+  run exit `3` rather than racing the first.
+- **Transient failures retry** with exponential backoff; a rejected token fails
+  immediately with instructions instead.
+
+Exit codes: `0` clean, `1` unresolved conflicts, `2` Keep/credential error,
+`3` another run holds the lock.
+
+For a cron job, `--conflict local` or `--conflict remote` avoids a job that
+exits `1` and waits for a human. Prefer `manual` for anything interactive.
 
 ## How the sync works
 
@@ -142,6 +177,8 @@ keep_bridge/
   syncstate.py   the ledger (merge base)
   store.py       local JSON receipts, one file each
   sync.py        the engine
+  atomic.py      crash-safe file writes
+  lock.py        one run at a time
   cli.py         keep-bridge
   backends/
     base.py      the five-method surface the engine needs
@@ -158,5 +195,9 @@ pytest
 
 The whole engine is covered offline against the fake backend: creation in both
 directions, clean pushes and pulls, simultaneous edits, conflicts under all
-three policies, trashing both ways, purged notes, a lost or corrupt ledger, and
-dry runs.
+three policies, trashing both ways, purged notes, a lost or corrupt ledger,
+dry runs, non-receipt notes under the label, crash-safe writes and the run
+lock.
+
+The live `gkeepapi` backend is the one part not covered — it needs real
+credentials. `keep-bridge check` is how you exercise it safely.

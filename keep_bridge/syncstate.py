@@ -10,6 +10,8 @@ import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from . import atomic
+
 STATE_VERSION = 1
 
 
@@ -55,12 +57,11 @@ class SyncState:
         }
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "version": STATE_VERSION,
             "links": {rid: asdict(link) for rid, link in sorted(self.links.items())},
         }
-        self.path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        atomic.write_text(self.path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
     # -- lookups ------------------------------------------------------
     def by_receipt(self, receipt_id: str) -> LinkState | None:

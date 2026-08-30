@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from . import atomic
 from .model import Receipt
 
 
@@ -38,7 +39,7 @@ class ReceiptStore:
     def save(self, receipt: Receipt) -> Path:
         self.root.mkdir(parents=True, exist_ok=True)
         path = self.path_for(receipt.id)
-        path.write_text(json.dumps(receipt.to_dict(), indent=2, sort_keys=True) + "\n")
+        atomic.write_text(path, json.dumps(receipt.to_dict(), indent=2, sort_keys=True) + "\n")
         return path
 
     def delete(self, receipt_id: str) -> None:

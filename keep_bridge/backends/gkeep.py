@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 
+from .. import atomic
 from .base import KeepNote
 
 TOKEN_ENV = "KEEP_MASTER_TOKEN"
@@ -24,6 +26,35 @@ EMAIL_ENV = "KEEP_EMAIL"
 
 class KeepAuthError(RuntimeError):
     """Raised when Keep cannot be reached or the master token is rejected."""
+
+
+class KeepTokenExpired(KeepAuthError):
+    """The master token was rejected and a new one must be minted in a browser."""
+
+
+def _retry(operation, what: str, attempts: int = 4, base_delay: float = 2.0):
+    """Retry a Keep call through transient network and server failures.
+
+    Only transient classes are retried. An auth failure is permanent and is
+    raised immediately rather than hammering Google with a dead token.
+    """
+    from gkeepapi import exception as gexc
+
+    last: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return operation()
+        except (gexc.LoginException, gexc.BrowserLoginRequiredException) as exc:
+            raise KeepTokenExpired(
+                f"{what}: Keep rejected the master token ({exc}). Mint a new one "
+                "(see README: authenticating) and update $KEEP_MASTER_TOKEN."
+            ) from exc
+        except (gexc.APIException, gexc.SyncException, OSError) as exc:
+            last = exc
+            if attempt == attempts - 1:
+                break
+            time.sleep(base_delay * (2**attempt))
+    raise KeepAuthError(f"{what} failed after {attempts} attempts: {last}")
 
 
 class GKeepBackend:
@@ -66,8 +97,14 @@ class GKeepBackend:
 
         keep = gkeepapi.Keep()
         state = self._load_state()
-        try:
+
+        def authenticate():
             keep.authenticate(self.email, self._token, state=state, sync=True)
+
+        try:
+            _retry(authenticate, "authenticating with Keep")
+        except KeepAuthError:
+            raise
         except Exception as exc:  # gkeepapi raises a wide range of errors
             raise KeepAuthError(f"Keep authentication failed: {exc}") from exc
         self._keep = keep
@@ -83,8 +120,8 @@ class GKeepBackend:
     def _save_state(self) -> None:
         if not self.state_path or self._keep is None:
             return
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        self.state_path.write_text(json.dumps(self._keep.dump()))
+        # 0600: this cache holds a plaintext copy of every synced note.
+        atomic.write_text(self.state_path, json.dumps(self._keep.dump()), mode=0o600)
 
     def _label(self, name: str):
         """Fetch the sync label, creating it the first time the bridge runs."""
@@ -138,8 +175,15 @@ class GKeepBackend:
     def flush(self) -> None:
         if self._keep is None:
             return
-        try:
-            self._keep.sync()
-        except Exception as exc:
-            raise KeepAuthError(f"pushing changes to Keep failed: {exc}") from exc
+        from gkeepapi import exception as gexc
+
+        def push():
+            try:
+                self._keep.sync()
+            except gexc.ResyncRequiredException:
+                # Our cached state diverged too far from the server. A full
+                # resync discards the cache, not the pending local writes.
+                self._keep.sync(resync=True)
+
+        _retry(push, "pushing changes to Keep")
         self._save_state()

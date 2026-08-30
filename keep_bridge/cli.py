@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
 from .backends.base import KeepBackend
 from .backends.fake import FakeKeepBackend
 from .backends.gkeep import EMAIL_ENV, TOKEN_ENV, GKeepBackend, KeepAuthError
+from .lock import LockBusy, run_lock
 from .merge import ConflictPolicy
 from .model import Receipt
+from .serialize import extract_marker, looks_like_receipt
 from .store import ReceiptStore
 from .sync import DEFAULT_LABEL, SyncEngine, SyncReport
 from .syncstate import SyncState
@@ -59,9 +62,16 @@ def cmd_sync(args) -> int:
         _backend(args, session_path),
         label=args.label,
         policy=ConflictPolicy(args.conflict),
+        adopt_unrecognized=args.adopt_unrecognized,
     )
     try:
-        report = engine.run(dry_run=args.dry_run)
+        # One run at a time: concurrent runs would merge against the same
+        # stale base and race each other's writes.
+        with run_lock(Path(args.state_dir) / "lock"):
+            report = engine.run(dry_run=args.dry_run)
+    except LockBusy as exc:
+        print(f"keep-bridge: {exc}", file=sys.stderr)
+        return 3
     except KeepAuthError as exc:
         print(f"keep-bridge: {exc}", file=sys.stderr)
         return 2
@@ -69,6 +79,36 @@ def cmd_sync(args) -> int:
     # Unresolved conflicts are a non-zero exit so a cron job or CI step
     # surfaces them instead of reporting a clean run.
     return 1 if report.conflicts and args.conflict == ConflictPolicy.MANUAL.value else 0
+
+
+def cmd_check(args) -> int:
+    """Read-only pre-flight: prove credentials work and show the blast radius.
+
+    Writes nothing to Keep or to disk. This is the first thing to run against
+    a real account, before any sync.
+    """
+    _, _, session_path = _paths(args)
+    backend = _backend(args, session_path)
+    try:
+        notes = backend.list_notes(args.label)
+    except KeepAuthError as exc:
+        print(f"keep-bridge: {exc}", file=sys.stderr)
+        return 2
+
+    live = [n for n in notes if not n.trashed]
+    ours = [n for n in live if extract_marker(n.text)]
+    shaped = [n for n in live if n not in ours and looks_like_receipt(n.text)]
+    skipped = [n for n in live if n not in ours and n not in shaped]
+
+    print(f"connected as {args.email or os.environ.get(EMAIL_ENV, '(unset)')}")
+    print(f"label {args.label!r}: {len(live)} live notes, {len(notes) - len(live)} trashed")
+    print(f"  {len(ours)} already linked to a receipt")
+    print(f"  {len(shaped)} would be imported as receipts")
+    print(f"  {len(skipped)} not receipt-shaped, would be left untouched")
+    if args.verbose:
+        for note in skipped:
+            print(f"    skip: {note.id} {note.title[:60]!r}")
+    return 0
 
 
 def cmd_status(args) -> int:
@@ -168,7 +208,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=ConflictPolicy.MANUAL.value,
         help="who wins when both sides changed the same field (default: manual)",
     )
+    p_sync.add_argument(
+        "--adopt-unrecognized",
+        action="store_true",
+        help="also import labelled notes that show no receipt fields "
+        "(default: leave them untouched)",
+    )
     p_sync.set_defaults(func=cmd_sync)
+
+    sub.add_parser(
+        "check", parents=[common], help="read-only pre-flight against Keep"
+    ).set_defaults(func=cmd_check)
 
     sub.add_parser(
         "status", parents=[common], help="show local/ledger state"

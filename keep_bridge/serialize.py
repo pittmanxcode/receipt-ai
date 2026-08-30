@@ -95,6 +95,23 @@ def extract_marker(text: str) -> str | None:
     return match.group(1) if match else None
 
 
+def looks_like_receipt(text: str) -> bool:
+    """Whether a note is safe to treat as a receipt.
+
+    A note carrying our marker is ours. Otherwise it has to show at least one
+    recognised field header. Everything under the sync label that fails this
+    is left strictly alone -- importing it would rewrite someone's note into a
+    receipt template, and the first sync must not vandalise a real account.
+    """
+    if MARKER_RE.search(text or ""):
+        return True
+    for raw_line in (text or "").splitlines():
+        header = _HEADER_RE.match(raw_line.rstrip())
+        if header and header.group(1).strip().lower() in _FIELD_ALIASES:
+            return True
+    return False
+
+
 def _parse_item(raw: str) -> LineItem | None:
     body = raw.strip()
     if not body:
@@ -163,7 +180,10 @@ def parse_note(text: str, receipt_id: str) -> Receipt:
             section = None
             continue
 
-        if line.strip() and section is None and note_lines:
+        # Anything we do not recognise is kept as note text. Dropping it would
+        # be silent data loss: the parsed receipt is written straight back to
+        # Keep, so a line lost here is a line erased from the user's note.
+        if line.strip():
             note_lines.append(raw_line)
 
     if items:

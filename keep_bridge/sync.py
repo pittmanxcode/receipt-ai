@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from .backends.base import KeepBackend, KeepNote
 from .merge import ConflictPolicy, FieldConflict, merge_content
 from .model import Receipt, content_differs, new_id
-from .serialize import extract_marker, note_text, note_title, parse_note
+from .serialize import extract_marker, looks_like_receipt, note_text, note_title, parse_note
 from .store import ReceiptStore
 from .syncstate import SyncState
 
@@ -30,7 +30,7 @@ def _now() -> str:
 class ReceiptOutcome:
     receipt_id: str
     action: str  # created_local | created_remote | updated_local | updated_remote
-                 # | updated_both | relinked | dropped_link | unchanged
+                 # | updated_both | dropped_link | skipped_unrecognized | unchanged
     conflicts: list[FieldConflict] = field(default_factory=list)
     detail: str = ""
 
@@ -64,6 +64,9 @@ class SyncReport:
             f"{self.count('updated_both')} merged both ways",
             f"{self.count('unchanged')} unchanged",
         ]
+        skipped = self.count("skipped_unrecognized")
+        if skipped:
+            bits.append(f"{skipped} skipped (not receipt-shaped)")
         line = f"{prefix}: " + ", ".join(bits)
         if self.conflicts:
             line += f" -- {len(self.conflicts)} with conflicts"
@@ -78,12 +81,14 @@ class SyncEngine:
         backend: KeepBackend,
         label: str = DEFAULT_LABEL,
         policy: ConflictPolicy = ConflictPolicy.MANUAL,
+        adopt_unrecognized: bool = False,
     ) -> None:
         self.store = store
         self.state = state
         self.backend = backend
         self.label = label
         self.policy = policy
+        self.adopt_unrecognized = adopt_unrecognized
 
     # -- pairing ------------------------------------------------------
     def _pair(
@@ -195,6 +200,16 @@ class SyncEngine:
         """A labelled note with no receipt: import it, unless it is trash."""
         if note.trashed:
             report.add(receipt_id, "unchanged", detail="trashed note, not imported")
+            return False
+
+        if not self.adopt_unrecognized and not looks_like_receipt(note.text):
+            # Someone else's note that happens to carry the label. Importing it
+            # would rewrite their text into a receipt template, so leave it be.
+            report.add(
+                receipt_id,
+                "skipped_unrecognized",
+                detail=f"note {note.id}: no receipt fields; left untouched",
+            )
             return False
 
         receipt = self._receipt_from_note(note, receipt_id)

@@ -36,7 +36,8 @@ def test_offline_dry_run_needs_no_credentials(tmp_path, capsys):
 
     assert run(tmp_path, "sync", "--offline", "--dry-run") == 0
     assert "1 new to Keep" in capsys.readouterr().out
-    assert not (tmp_path / "state").exists()
+    # The lock file may exist; the ledger must not -- a dry run agrees to nothing.
+    assert not (tmp_path / "state" / "sync-state.json").exists()
 
 
 def test_sync_without_credentials_fails_cleanly(tmp_path, capsys, monkeypatch):
