@@ -342,6 +342,53 @@ def sync_account(email, client, state, args, budget) -> tuple[int, int, int]:
     return created, skipped_edited, failed
 
 
+def undo() -> int:
+    """Remove every row this bridge created, and forget them.
+
+    Scope is the state file: only pages this bridge recorded creating are
+    touched, so nothing typed straight into the Inbox is at risk. Notion
+    moves them to trash, where they can be restored for 30 days.
+    """
+    state = load_state()
+    entries = [
+        (key, record["notion_page_id"])
+        for key, record in state["notes"].items()
+        if record.get("notion_page_id")
+    ]
+    if not entries:
+        log("nothing recorded as created; nothing to remove")
+        return 0
+
+    notion_token = env("NOTION_TOKEN").strip()
+    if not notion_token:
+        log("NOTION_TOKEN missing from .env")
+        return 1
+
+    from notion_client import Client
+
+    client = Client(auth=notion_token)
+    log(f"removing {len(entries)} rows this bridge created")
+
+    removed = failed = 0
+    for key, page_id in entries:
+        try:
+            try:
+                client.pages.update(page_id=page_id, in_trash=True)
+            except TypeError:
+                client.pages.update(page_id=page_id, archived=True)
+        except Exception as exc:
+            failed += 1
+            log(f"could not remove {page_id}: {describe(exc)}")
+            continue
+        state["notes"].pop(key, None)
+        # Saved as we go, so an interrupted undo does not lose its place.
+        save_state(state)
+        removed += 1
+
+    log(f"undo finished: {removed} removed, {failed} failed")
+    return 1 if failed else 0
+
+
 def check() -> int:
     """Read-only preflight: which Keep account is behind each token, and can
     Notion actually be written to.
@@ -432,6 +479,12 @@ def run(args) -> int:
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Capture Google Keep notes into the Notes Inbox.")
     parser.add_argument(
+        "--undo",
+        action="store_true",
+        help="move every row this bridge created to Notion's trash and forget "
+        "them. Touches nothing else in the database.",
+    )
+    parser.add_argument(
         "--check",
         action="store_true",
         help="read-only preflight: which account each token opens, and whether "
@@ -478,6 +531,8 @@ def parse_args(argv=None):
 
 def main() -> int:
     args = parse_args()
+    if args.undo:
+        return undo()
     if args.check:
         return check()
     LOCK_PATH.touch(exist_ok=True)
