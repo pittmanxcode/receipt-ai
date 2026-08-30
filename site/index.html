@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Receipts</title>
+<meta name="description" content="A correction record, a ruleset with sources, and the app being built on top of them.">
+<style>
+  :root {
+    --bg: #fbfaf8;
+    --surface: #ffffff;
+    --ink: #1a1a18;
+    --ink-soft: #55534e;
+    --ink-faint: #86837c;
+    --line: #e2ded6;
+    --accent: #3d5a45;
+    --chip-bg: #eef1ec;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #14150f;
+      --surface: #1c1e17;
+      --ink: #f0eee7;
+      --ink-soft: #b6b3a9;
+      --ink-faint: #85827a;
+      --line: #2e3128;
+      --accent: #9dc0a5;
+      --chip-bg: #252820;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #14150f;
+    --surface: #1c1e17;
+    --ink: #f0eee7;
+    --ink-soft: #b6b3a9;
+    --ink-faint: #85827a;
+    --line: #2e3128;
+    --accent: #9dc0a5;
+    --chip-bg: #252820;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 16px/1.65 ui-sans-serif, -apple-system, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 660px; margin: 0 auto; padding: 88px 24px 96px; }
+  @media (max-width: 600px) { .wrap { padding: 56px 20px 64px; } }
+
+  header { margin-bottom: 56px; }
+  .mark {
+    font-size: 13px;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    margin: 0 0 20px;
+  }
+  h1 {
+    font-size: clamp(30px, 6vw, 40px);
+    line-height: 1.15;
+    letter-spacing: -.02em;
+    margin: 0 0 20px;
+    font-weight: 600;
+  }
+  .lede { font-size: 18px; color: var(--ink-soft); margin: 0; max-width: 52ch; }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 32px;
+  }
+  @media (max-width: 600px) { .card { padding: 24px; } }
+
+  .card-top {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 16px;
+  }
+  h2 { font-size: 21px; margin: 0; font-weight: 600; letter-spacing: -.01em; }
+  .status {
+    font-size: 12px;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    color: var(--accent);
+    background: var(--chip-bg);
+    border-radius: 999px;
+    padding: 4px 11px;
+    font-weight: 600;
+  }
+  .card p { color: var(--ink-soft); margin: 0 0 24px; }
+
+  ul.parts { list-style: none; padding: 0; margin: 0 0 28px; }
+  ul.parts li {
+    padding: 14px 0;
+    border-top: 1px solid var(--line);
+    display: grid;
+    grid-template-columns: 128px 1fr;
+    gap: 16px;
+    align-items: baseline;
+  }
+  @media (max-width: 520px) {
+    ul.parts li { grid-template-columns: 1fr; gap: 4px; }
+  }
+  ul.parts .name { font-weight: 600; font-size: 15px; }
+  ul.parts .what { color: var(--ink-soft); font-size: 15px; }
+
+  .links { display: flex; gap: 20px; flex-wrap: wrap; align-items: center; }
+  a { color: var(--accent); text-decoration: none; font-weight: 600; }
+  a:hover { text-decoration: underline; }
+  a .arr { font-weight: 400; }
+
+  footer {
+    margin-top: 56px;
+    padding-top: 24px;
+    border-top: 1px solid var(--line);
+    color: var(--ink-faint);
+    font-size: 14px;
+  }
+  footer p { margin: 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <p class="mark">Receipts</p>
+    <h1>A record of corrections, and what gets built on it.</h1>
+    <p class="lede">
+      Every rule here came from somewhere: a specific correction on a specific date,
+      or a source named outright. The record is the point. The app is what the record is for.
+    </p>
+  </header>
+
+  <main>
+    <div class="card">
+      <div class="card-top">
+        <h2>One app, four parts</h2>
+        <span class="status">Building</span>
+      </div>
+      <p>
+        The pieces already run separately. This puts them behind one door, so a note
+        captured in the morning is filed, checked, and scheduled without being re-entered anywhere.
+      </p>
+
+      <ul class="parts">
+        <li>
+          <span class="name">Rules</span>
+          <span class="what">The working ruleset, each rule carrying its correction or its source.</span>
+        </li>
+        <li>
+          <span class="name">Audit</span>
+          <span class="what">Re-checks its own filing on a schedule, logs every move and why.</span>
+        </li>
+        <li>
+          <span class="name">OS</span>
+          <span class="what">The daily loop: capture, file, brief, review, act.</span>
+        </li>
+        <li>
+          <span class="name">Notes aggregation</span>
+          <span class="what">Notes from every source land in one inbox instead of four.</span>
+        </li>
+      </ul>
+
+      <div class="links">
+        <a href="https://github.com/pittmanxcode/receipts">Repository <span class="arr">&#8599;</span></a>
+      </div>
+    </div>
+  </main>
+
+  <footer>
+    <p>Status is current as of the last commit. Nothing here is finished.</p>
+  </footer>
+
+</div>
+</body>
+</html>
