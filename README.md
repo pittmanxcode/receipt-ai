@@ -52,9 +52,22 @@ master token to it.
 ### 2. First sync
 
 ```sh
-python3 sync.py     # run 1: creates rows
-python3 sync.py     # run 2: creates zero duplicates
+python3 sync.py --dry-run          # see what would be created, write nothing
+python3 sync.py --since 2026-08-29 # just recent notes, to prove the pipe
+python3 sync.py                    # everything
+python3 sync.py                    # run again: creates zero duplicates
 ```
+
+`--dry-run` writes nothing to Notion and nothing to state. `--limit N` stops
+after N rows. `--since YYYY-MM-DD` takes only notes edited in Keep on or after
+that date. launchd runs `sync.py` with no arguments, so scheduled behaviour is
+unaffected by any of them.
+
+**Before a first run against a back catalogue:** `Captured` in the Notes Inbox
+is a Notion `created_time` — it records when the *row* was made, not when the
+note was written, and nothing can set it. So importing an old note stamps it
+with today. Stage the backlog with `--since` or `--limit` if that matters to
+how the sweep files things.
 
 Dedupe is by Keep note id in `.sync_state.json`, written after **each** row, so
 an interrupted run never re-creates what it just made. A note edited in Keep

@@ -15,6 +15,7 @@ documented v1 limitation, not an oversight.
 
 from __future__ import annotations
 
+import argparse
 import fcntl
 import json
 import os
@@ -137,11 +138,21 @@ def note_title(node) -> str:
     return title[:TITLE_LIMIT]
 
 
-def selected_notes(keep) -> list:
-    """Non-trashed notes, optionally narrowed to one Keep label.
+def note_updated(node):
+    stamp = getattr(node.timestamps, "updated", None)
+    if stamp is None:
+        return None
+    if stamp.tzinfo is None:
+        return stamp.replace(tzinfo=timezone.utc)
+    return stamp
 
-    KEEP_LABEL is the safety valve: unset means every live note is captured,
-    which is what full capture requires; set it to stage a smaller first run.
+
+def selected_notes(keep, since=None) -> list:
+    """Non-trashed notes, optionally narrowed to one Keep label and a date.
+
+    KEEP_LABEL and --since are the staging valves. Neither is set in normal
+    operation: full capture is the point. They exist so a first run against a
+    large back catalogue can be taken in bounded steps.
     """
     label_name = env("KEEP_LABEL").strip()
     label = keep.findLabel(label_name) if label_name else None
@@ -155,6 +166,10 @@ def selected_notes(keep) -> list:
             continue
         if label is not None and node.labels.get(label.id) is None:
             continue
+        if since is not None:
+            updated = note_updated(node)
+            if updated is None or updated < since:
+                continue
         notes.append(node)
     return notes
 
@@ -218,7 +233,7 @@ def create_row(client, node) -> str:
 # -- run ------------------------------------------------------------------
 
 
-def run() -> int:
+def run(args) -> int:
     from notion_client import Client
 
     notion_token = env("NOTION_TOKEN").strip()
@@ -230,11 +245,15 @@ def run() -> int:
     synced = state["notes"]
 
     keep = open_keep()
-    client = Client(auth=notion_token)
+    client = None if args.dry_run else Client(auth=notion_token)
 
     created = skipped_edited = failed = 0
-    for node in selected_notes(keep):
-        updated = getattr(node.timestamps, "updated", None)
+    for node in selected_notes(keep, since=args.since):
+        if args.limit is not None and created >= args.limit:
+            log(f"reached the limit of {args.limit}; stopping this run")
+            break
+
+        updated = note_updated(node)
         updated_iso = updated.isoformat() if updated else ""
 
         record = synced.get(node.id)
@@ -242,6 +261,11 @@ def run() -> int:
             if updated_iso and record.get("keep_updated") and updated_iso > record["keep_updated"]:
                 log(f"edited in Keep after it synced, skipped (v1 limitation): {note_title(node)!r}")
                 skipped_edited += 1
+            continue
+
+        if args.dry_run:
+            log(f"would create row for {note_title(node)!r}")
+            created += 1
             continue
 
         try:
@@ -261,14 +285,40 @@ def run() -> int:
         created += 1
         log(f"created row for {note_title(node)!r}")
 
+    verb = "would create" if args.dry_run else "created"
     if created == 0 and skipped_edited == 0 and failed == 0:
         log("no new notes")
     else:
-        log(f"run finished: {created} created, {skipped_edited} edited-skipped, {failed} failed")
+        log(f"run finished: {created} {verb}, {skipped_edited} edited-skipped, {failed} failed")
     return 1 if failed else 0
 
 
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Capture Google Keep notes into the Notes Inbox.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what would be created; write nothing to Notion or to state",
+    )
+    parser.add_argument(
+        "--limit", type=int, help="create at most N rows this run, then stop"
+    )
+    parser.add_argument(
+        "--since",
+        metavar="YYYY-MM-DD",
+        help="only notes edited in Keep on or after this date",
+    )
+    args = parser.parse_args(argv)
+    if args.since:
+        try:
+            args.since = datetime.strptime(args.since, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            parser.error(f"--since needs YYYY-MM-DD, got {args.since!r}")
+    return args
+
+
 def main() -> int:
+    args = parse_args()
     LOCK_PATH.touch(exist_ok=True)
     handle = os.open(LOCK_PATH, os.O_RDWR)
     try:
@@ -277,7 +327,7 @@ def main() -> int:
         except OSError:
             # launchd fired again while the previous run is still going.
             return 0
-        return run()
+        return run(args)
     finally:
         os.close(handle)
 
