@@ -1,203 +1,101 @@
-# receipts
+# Keep → Notion capture bridge
 
-Receipt records kept as JSON in this repo, two-way synced with Google Keep so
-they can be captured from a phone and reconciled from a laptop.
+The capture leg of the daily OS. Notes spoken or typed into Google Keep land
+automatically as rows in the **📥 Notes Inbox** Notion database, with no taps.
+A separate system sweeps that Inbox and files them; this bridge does not.
 
-## Why a "bridge" and not just an API client
+One way, Keep → Notion. This code never modifies a Keep note.
 
-Google publishes **no consumer API for Keep**. The official
-`keep.googleapis.com` API is Workspace-enterprise only, and even there it can
-only see notes its own service account created or that were explicitly shared
-with it — it cannot read the notes in a personal account.
+## Files
 
-So this bridge drives [`gkeepapi`](https://github.com/kiwiz/gkeepapi), which
-speaks the Keep app's private protocol. That comes with real caveats:
-
-- It is **unofficial and reverse-engineered**. Google can change the protocol
-  and break it without notice.
-- It authenticates with a **master token**, not a password (see below).
-- It is not a supported integration; use it on an account you are willing to
-  have locked out of, and keep this repo as the durable copy of your data.
-
-Everything above `keep_bridge/backends/` is independent of `gkeepapi`, so the
-sync engine is fully tested against an in-memory fake and does not need
-credentials or a network to verify.
-
-## Install
-
-```sh
-pip install -e '.[dev]'
-```
-
-## Authenticating
-
-Keep has no password or OAuth-app login here — `gkeepapi` authenticates with a
-**master token**, which is long-lived and grants full account access. Treat it
-exactly like a password.
-
-Minting one is a browser flow, because `gpsoauth.perform_master_login()` with a
-password or app password now generally returns `BadAuthentication`:
-
-1. Open <https://accounts.google.com/EmbeddedSetup> in a browser and sign in
-   fully with the account you want to sync.
-2. Accept the agreement prompt. The page may then appear to load forever —
-   that is expected; carry on.
-3. In devtools, copy the value of the **`oauth_token` cookie**. It starts with
-   `oauth2_4/` or `oauth2_1/`.
-4. Exchange it for a master token:
-
-   ```python
-   import gpsoauth
-   print(gpsoauth.exchange_token("you@gmail.com", "oauth2_4/...", "0123456789abcdef")["Token"])
-   ```
-
-   The third argument is an arbitrary but **stable** 16-hex-character device id
-   — reuse the same one, since Google ties the token to it.
-
-The result starts with `aas_et/`. Put it in the environment; nothing writes it
-to disk:
-
-```sh
-export KEEP_EMAIL='you@gmail.com'
-export KEEP_MASTER_TOKEN='aas_et/...'
-```
-
-The token does not expire on a schedule, but it is revoked by a password
-change, by signing the "device" out from your Google account's device list, and
-sometimes by Google on its own. When that happens `keep-bridge` fails with a
-message telling you to mint a new one rather than retrying a dead token.
-
-## Going to production
-
-Run these in order the first time against a real account. The first two write
-nothing at all.
-
-```sh
-keep-bridge check                 # 1. read-only: proves auth, shows blast radius
-keep-bridge sync --dry-run -v     # 2. exactly what would move, still no writes
-keep-bridge sync                  # 3. for real
-```
-
-`check` reports how many notes under the label are already linked, how many
-would be imported, and how many are **not receipt-shaped** and will be left
-untouched. Read that last number before step 3.
-
-Safety properties worth knowing:
-
-- **A labelled note that shows no receipt fields is never touched.** Importing
-  it would rewrite someone's text into a receipt template. `--adopt-unrecognized`
-  overrides this; its text is preserved in the `Notes:` section either way.
-- **Nothing that cannot be parsed is discarded.** Unrecognised lines land in
-  `Notes:`, so a round-trip through Keep never erases text.
-- **Writes are crash-safe.** The ledger and every receipt file are written to a
-  temp file and renamed, so an interrupted run cannot truncate the merge base.
-- **One run at a time.** A lock file in the state dir makes a second concurrent
-  run exit `3` rather than racing the first.
-- **Transient failures retry** with exponential backoff; a rejected token fails
-  immediately with instructions instead.
-
-Exit codes: `0` clean, `1` unresolved conflicts, `2` Keep/credential error,
-`3` another run holds the lock.
-
-For a cron job, `--conflict local` or `--conflict remote` avoids a job that
-exits `1` and waits for a human. Prefer `manual` for anything interactive.
-
-## How the sync works
-
-Each run reads both sides, three-way merges every pair in memory, applies the
-writes, and saves the ledger last — so an interrupted run re-syncs cleanly
-rather than recording agreement that never happened.
-
-The merge base is `.keep-bridge/sync-state.json`: what the two sides last
-agreed on. Comparing against a base is what makes this a real two-way sync
-instead of last-writer-wins — a field only changes on a side when the *other*
-side is the only one that touched it. Edits to different fields of the same
-receipt, made on both sides between runs, all survive.
-
-**Conflicts** — both sides changed the same field to different values:
-
-| `--conflict` | behaviour |
+| file | what it does |
 | --- | --- |
-| `manual` (default) | each side keeps its own value, the conflict is reported, and `sync` exits `1`. Nothing is overwritten and it is re-reported until resolved. |
-| `local` | the repo wins |
-| `remote` | Keep wins |
+| `auth_setup.py` | one-time interactive Google auth; mints and verifies the master token |
+| `sync.py` | the scheduled run: every non-trashed Keep note becomes one Inbox row, once |
+| `com.michael.keepbridge.plist` | LaunchAgent that runs `sync.py` every 15 minutes |
+| `envfile.py` | ~60-line `.env` reader/writer so neither script needs `python-dotenv` |
 
-Tags are the exception: they set-merge, so additions from both sides stick and
-a removal on either side wins. Two people adding tags is not a collision.
+## Setup
 
-**Deletion** — trashing a receipt trashes its note, and trashing a note in Keep
-marks the receipt `trashed`. Trash is recoverable on both sides, so nothing is
-destroyed. A note that *vanishes* from Keep entirely (Keep empties its own
-trash after about a week, or the label was removed) is **rebuilt** rather than
-treated as a delete: letting an automatic purge erase committed receipt data
-would be data loss nobody asked for. A deliberate delete arrives as a trashed
-note, which is seen and propagated before the purge.
-
-**Lost ledger** — every note carries its receipt id in its body
-(`[receipt:…]`). If the ledger is deleted or corrupted, the next run re-links
-notes to records instead of duplicating them.
-
-## The note format
-
-The note body is canonical and is meant to be hand-edited in the Keep app; the
-title is derived on every push and ignored on pull. Parsing is forgiving —
-`merchant:`/`vendor:`, `amount:`/`total:`, `8/14/2026` or `2026-08-14`,
-`$1,234.50`, bullets with or without a dash. A field that cannot be parsed
-falls back to its default rather than failing the run.
+`.env` holds everything and is never committed:
 
 ```
-Vendor: Trader Joe's
-Date: 2026-08-14
-Total: 42.17
-Currency: USD
-Category: groceries
-Payment: visa-1234
-Tags: food, reimbursable
-
-Items:
-- 2 x Bananas — 3.98
-- Oat milk — 4.49
-
-Notes:
-split with Dana
-
-[receipt:65488fe85b2a44999e1d90fbc63d053f]
+EMAIL=...                      # the Google account
+NOTION_TOKEN=...               # integration "google keep bridge"
+NOTION_PARENT_PAGE_ID=3cb540deb7fe81d2a25eebd078e5360f
+GOOGLE_KEEP_TOKEN=             # auth_setup.py fills this in
+KEEP_DEVICE_ID=                # auth_setup.py fills this in
+KEEP_LABEL=                    # optional: restrict to one Keep label
 ```
 
-Notes that land under the `receipts` label are rewritten into this shape on
-first import, which is also what gives them their `[receipt:…]` marker.
-
-## Layout
-
-```
-keep_bridge/
-  model.py       receipt + line items, parsing and normalization
-  serialize.py   receipt <-> Keep note body
-  merge.py       three-way field merge and conflict policy
-  syncstate.py   the ledger (merge base)
-  store.py       local JSON receipts, one file each
-  sync.py        the engine
-  atomic.py      crash-safe file writes
-  lock.py        one run at a time
-  cli.py         keep-bridge
-  backends/
-    base.py      the five-method surface the engine needs
-    fake.py      in-memory Keep, for tests and --offline
-    gkeep.py     the live gkeepapi backend
-data/receipts/   one JSON file per receipt
-```
-
-## Tests
+### 1. Authenticate (once)
 
 ```sh
-pytest
+python3 auth_setup.py
 ```
 
-The whole engine is covered offline against the fake backend: creation in both
-directions, clean pushes and pulls, simultaneous edits, conflicts under all
-three policies, trashing both ways, purged notes, a lost or corrupt ledger,
-dry runs, non-receipt notes under the label, crash-safe writes and the run
-lock.
+It walks you through getting an `oauth_token` cookie from
+<https://accounts.google.com/EmbeddedSetup>, exchanges it for a master token,
+**verifies it by signing in to Keep**, then writes it to `.env` (mode `600`).
 
-The live `gkeepapi` backend is the one part not covered — it needs real
-credentials. `keep-bridge check` is how you exercise it safely.
+The single most common failure is a spent code. The browser code is
+**single-use and expires in minutes** — use a fresh incognito window and come
+straight back. `Authentication error: Unknown` means the code was already used
+or had expired, not that anything is misconfigured. The script says exactly
+what to redo on every failure path.
+
+`KEEP_DEVICE_ID` is generated once and must never change: Google ties the
+master token to it.
+
+### 2. First sync
+
+```sh
+python3 sync.py     # run 1: creates rows
+python3 sync.py     # run 2: creates zero duplicates
+```
+
+Dedupe is by Keep note id in `.sync_state.json`, written after **each** row, so
+an interrupted run never re-creates what it just made. A note edited in Keep
+after it synced is logged and skipped — a documented v1 limitation.
+
+### 3. Schedule
+
+```sh
+sed -e "s|__PROJECT_DIR__|$PWD|g" \
+    -e "s|__VENV_PYTHON__|$PWD/.venv/bin/python3|g" \
+    com.michael.keepbridge.plist > ~/Library/LaunchAgents/com.michael.keepbridge.plist
+
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.michael.keepbridge.plist
+launchctl kickstart -p gui/$UID/com.michael.keepbridge   # fire one now
+```
+
+Verify — two timestamped entries 15 minutes apart:
+
+```sh
+launchctl print gui/$UID/com.michael.keepbridge | head -20
+tail -f sync.log
+```
+
+To pause and resume:
+
+```sh
+launchctl bootout gui/$UID/com.michael.keepbridge     # pause
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.michael.keepbridge.plist
+```
+
+## Scope and safety
+
+- **Writes touch only** data source `0cb32494-0d57-4039-bb1d-1a6c5ed66fc1`
+  (📥 Notes Inbox). No other Notion page is ever written.
+- **Keep is read-only.** No attribute is set on a note and nothing is pushed back.
+- `Section`, `Actionable` and `Confidence` are left empty for the OS to fill.
+- Credentials live only in `.env`. Nothing prints or logs a token; `.env`,
+  `.sync_state.json` and the logs are gitignored.
+- Overlapping runs are prevented by a lock, so a slow run cannot race the next
+  15-minute firing.
+
+## Notes on the Notion API
+
+`notion_client` 3.1.0 pins Notion-Version `2025-09-03`, where a row's parent is
+a **data source**, not a database — hence `data_source_id` above. `sync.py`
+falls back to `database_id` if it ever runs against an older API version.

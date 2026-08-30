@@ -1,10 +1,11 @@
+# Credentials and local run state. Never commit these.
+.env
+.sync_state.json
+sync.log
+launchd.out.log
+launchd.err.log
+
 __pycache__/
 *.py[cod]
-.pytest_cache/
 .venv/
 venv/
-*.egg-info/
-
-# Sync ledger and cached Keep session. Machine-local: the ledger records what
-# this checkout last agreed with Keep, and the session cache holds auth state.
-.keep-bridge/
