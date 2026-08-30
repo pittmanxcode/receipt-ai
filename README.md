@@ -58,7 +58,23 @@ what to redo on every failure path.
 `KEEP_DEVICE_ID` is generated once and must never change: Google ties the
 master token to it.
 
-### 2. First sync
+### 2. Preflight
+
+```sh
+python sync.py --check
+```
+
+Read-only, creates nothing. For each account it reports how many live notes
+the token actually opens and the three most recently edited titles — the way
+to confirm a token belongs to the account you think it does, since the browser
+sign-in is easy to do against the wrong Google account. It then checks Notion
+is reachable.
+
+If Notion reports it cannot find the database, the integration has not been
+shared with it: open **📥 Notes Inbox** in Notion → `•••` → **Connections** →
+add the integration. Connecting its parent page is *not* enough.
+
+### 3. First sync
 
 ```sh
 python sync.py --dry-run   # see what would be created, contact Notion not at all
@@ -89,7 +105,7 @@ Dedupe is by Keep note id in `.sync_state.json`, written after **each** row, so
 an interrupted run never re-creates what it just made. A note edited in Keep
 after it synced is logged and skipped — a documented v1 limitation.
 
-### 3. Schedule
+### 4. Schedule
 
 ```sh
 sed -e "s|__PROJECT_DIR__|$PWD|g" \

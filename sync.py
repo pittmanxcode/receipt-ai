@@ -85,10 +85,16 @@ def accounts() -> list[str]:
 
 
 def credentials(email: str) -> tuple[str, str | None]:
-    """(master token, device id) for one account, with single-account fallback."""
+    """(master token, device id) for one account.
+
+    The legacy single-account keys are honoured only while KEEP_ACCOUNTS is
+    unset. Once accounts are listed explicitly, every one must carry its own
+    token: a shared fallback could hand one account another's credentials and
+    file its notes under the wrong address.
+    """
     token = env(f"KEEP_TOKEN_{slug(email)}").strip()
     device = env(f"KEEP_DEVICE_ID_{slug(email)}").strip()
-    if not token and email == env("EMAIL").strip():
+    if not token and not env("KEEP_ACCOUNTS").strip() and email == env("EMAIL").strip():
         token = env("GOOGLE_KEEP_TOKEN").strip()
         device = env("KEEP_DEVICE_ID").strip()
     return token, (device or None)
@@ -336,6 +342,58 @@ def sync_account(email, client, state, args, budget) -> tuple[int, int, int]:
     return created, skipped_edited, failed
 
 
+def check() -> int:
+    """Read-only preflight: which Keep account is behind each token, and can
+    Notion actually be written to.
+
+    Creates nothing. Run this after adding an account or changing Notion
+    sharing -- it answers both questions without putting a row in the Inbox.
+    """
+    emails = accounts()
+    if not emails:
+        log("no accounts configured; set KEEP_ACCOUNTS in .env")
+        return 1
+
+    problems = 0
+    for email in emails:
+        keep = open_keep(email)
+        if keep is None:
+            problems += 1
+            continue
+        live = [n for n in keep.all() if not n.trashed]
+        recent = sorted(live, key=lambda n: note_updated(n) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+        log(f"{email}: signed in, {len(live)} live notes")
+        for node in recent[:3]:
+            when = note_updated(node)
+            stamp = when.astimezone().strftime("%Y-%m-%d %H:%M") if when else "unknown"
+            log(f"    most recent: {stamp}  {note_title(node)!r}")
+        if not recent:
+            log("    no live notes -- check this is the account you meant")
+
+    notion_token = env("NOTION_TOKEN").strip()
+    if not notion_token:
+        log("NOTION_TOKEN missing from .env")
+        return 1
+
+    from notion_client import Client
+
+    client = Client(auth=notion_token)
+    try:
+        source = client.data_sources.retrieve(data_source_id=DATA_SOURCE_ID)
+        title = "".join(t.get("plain_text", "") for t in source.get("title", []))
+        log(f"Notion: can reach the data source ({title or DATA_SOURCE_ID}) -- writes should work")
+    except Exception as exc:
+        problems += 1
+        log(f"Notion: cannot reach the target -- {describe(exc)}")
+        log(
+            "    Open the Notes Inbox database in Notion -> ... -> Connections -> "
+            "add the integration. Connecting its parent page is not enough."
+        )
+
+    log("preflight found no problems" if not problems else f"preflight found {problems} problem(s)")
+    return 1 if problems else 0
+
+
 def run(args) -> int:
     emails = accounts()
     if not emails:
@@ -373,6 +431,12 @@ def run(args) -> int:
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Capture Google Keep notes into the Notes Inbox.")
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="read-only preflight: which account each token opens, and whether "
+        "Notion is reachable. Creates nothing.",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -414,6 +478,8 @@ def parse_args(argv=None):
 
 def main() -> int:
     args = parse_args()
+    if args.check:
+        return check()
     LOCK_PATH.touch(exist_ok=True)
     handle = os.open(LOCK_PATH, os.O_RDWR)
     try:
