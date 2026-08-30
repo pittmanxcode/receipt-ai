@@ -1,6 +1,8 @@
 # Credentials and local run state. Never commit these.
 .env
 .sync_state.json
+drive_token.json
+credentials.json
 sync.log
 launchd.out.log
 launchd.err.log

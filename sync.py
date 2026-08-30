@@ -39,12 +39,22 @@ DATA_SOURCE_ID = "0cb32494-0d57-4039-bb1d-1a6c5ed66fc1"
 DATABASE_ID = "1eb54765d75c46cd8075a0c03f85b9a3"
 
 # Every capture source, and the Source value its rows carry in Notion.
-SOURCE_LABELS = {"keep": "Keep", "applenotes": "Apple Notes"}
+SOURCE_LABELS = {"keep": "Keep", "applenotes": "Apple Notes", "drive": "Recorder"}
 APPLENOTES_SCRIPT = "applenotes_probe.js"
 # Folders never captured. The JXA filters these too; this is the second line
 # of defence, since the folder name is localized on a non-English Mac and a
 # deleted note reaching the Inbox is worse than one missed.
 APPLENOTES_SKIP_FOLDERS = {"recently deleted", "deleted", "trash"}
+
+# Recorder shares a transcript as a Google Doc named like "Aug 29 at 4:43 PM".
+# The audio it exports separately uses a hyphen ("11-10 AM"), so accept both.
+RECORDER_TITLE_RE = re.compile(
+    r"^[A-Z][a-z]{2}\s+\d{1,2}\s+at\s+\d{1,2}[:\-]\d{2}\s*(AM|PM)$", re.I
+)
+DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
+DRIVE_CLIENT_SECRET = "credentials.json"
+DRIVE_TOKEN = "drive_token.json"
+CAPTURED_FOLDER = "Recorder Captured"
 
 DEFAULT_WINDOW_HOURS = 24
 TITLE_LIMIT = 200        # keep inbox rows scannable
@@ -114,13 +124,16 @@ def credentials(email: str) -> tuple[str, str | None]:
 class Item:
     """One capturable note, whatever produced it."""
 
-    def __init__(self, source: str, uid: str, title: str, text: str, updated, origin: str = ""):
+    def __init__(self, source: str, uid: str, title: str, text: str, updated, origin: str = "", on_captured=None):
         self.source = source
         self.uid = uid          # already namespaced by source; the state key
         self.title = title
         self.text = text
         self.updated = updated
         self.origin = origin    # account or folder, for the log line
+        self.on_captured = on_captured
+
+    on_captured = None  # optional callable, run once the row exists
 
     @property
     def label(self) -> str:
@@ -161,19 +174,28 @@ def load_state() -> dict:
     return data
 
 
-def save_state(state: dict) -> None:
-    handle, tmp_name = tempfile.mkstemp(dir=HERE, prefix=".sync_state.", suffix=".tmp")
+def atomic_json(path: Path, payload) -> None:
+    """Write JSON via temp-file-and-rename, 0600.
+
+    Used for sync state and for the Drive token: both are things an
+    interrupted write must not leave half-formed.
+    """
+    handle, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     tmp = Path(tmp_name)
     try:
         with os.fdopen(handle, "w") as fh:
-            json.dump(state, fh, indent=2, sort_keys=True)
+            json.dump(payload, fh, indent=2, sort_keys=True)
             fh.flush()
             os.fsync(fh.fileno())
         os.chmod(tmp, 0o600)
-        os.replace(tmp, STATE_PATH)
+        os.replace(tmp, path)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
+
+
+def save_state(state: dict) -> None:
+    atomic_json(STATE_PATH, state)
 
 
 # -- Keep -----------------------------------------------------------------
@@ -356,10 +378,160 @@ def applenotes_items(since) -> tuple[list, int]:
     return items, 0
 
 
+# -- Recorder, via Drive --------------------------------------------------
+
+
+def drive_service():
+    """An authorised Drive client, or None with the reason logged.
+
+    The consent flow opens a browser, which launchd cannot answer, so it only
+    runs from an interactive terminal. Scheduled runs with no stored token
+    report that and move on rather than stalling.
+    """
+    try:
+        from google.auth.transport.requests import Request
+        from google.oauth2.credentials import Credentials
+        from google_auth_oauthlib.flow import InstalledAppFlow
+        from googleapiclient.discovery import build
+    except ImportError:
+        log("Drive libraries missing; run: pip install google-api-python-client google-auth-oauthlib")
+        return None
+
+    token_path = HERE / DRIVE_TOKEN
+    secret_path = HERE / DRIVE_CLIENT_SECRET
+    creds = None
+    if token_path.exists():
+        try:
+            creds = Credentials.from_authorized_user_file(str(token_path), DRIVE_SCOPES)
+        except Exception:
+            creds = None
+
+    if creds and creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+        except Exception as exc:
+            log(f"Drive token could not be refreshed ({exc}); re-authorise interactively")
+            creds = None
+
+    if not creds or not creds.valid:
+        if not sys.stdin.isatty():
+            log("Drive is not authorised yet, and consent needs a browser.")
+            log("    Run once from Terminal:  python sync.py --source drive --dry-run")
+            return None
+        if not secret_path.exists():
+            log(f"{DRIVE_CLIENT_SECRET} is missing -- see README: authorising Drive")
+            return None
+        flow = InstalledAppFlow.from_client_secrets_file(str(secret_path), DRIVE_SCOPES)
+        creds = flow.run_local_server(port=0)
+        atomic_json(token_path, json.loads(creds.to_json()))
+        log(f"Drive authorised; token saved to {DRIVE_TOKEN}")
+
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def _captured_folder(service) -> str | None:
+    """The folder finished transcripts are moved into, created on first use."""
+    safe = CAPTURED_FOLDER.replace("'", "\\'")
+    query = (
+        "mimeType='application/vnd.google-apps.folder' and trashed=false "
+        f"and name='{safe}'"
+    )
+    try:
+        found = service.files().list(q=query, fields="files(id)", pageSize=1).execute()
+        if found.get("files"):
+            return found["files"][0]["id"]
+        created = service.files().create(
+            body={"name": CAPTURED_FOLDER, "mimeType": "application/vnd.google-apps.folder"},
+            fields="id",
+        ).execute()
+        return created["id"]
+    except Exception as exc:
+        log(f"could not prepare the {CAPTURED_FOLDER!r} folder: {exc}")
+        return None
+
+
+def drive_items(since) -> tuple[list, int]:
+    """Recorder transcripts shared into Drive as Google Docs."""
+    service = drive_service()
+    if service is None:
+        return [], 1
+
+    query = [
+        "mimeType='application/vnd.google-apps.document'",
+        "trashed=false",
+        "'root' in parents",
+    ]
+    if since:
+        query.append(f"modifiedTime > '{since.astimezone(timezone.utc):%Y-%m-%dT%H:%M:%SZ}'")
+
+    try:
+        listed = service.files().list(
+            q=" and ".join(query),
+            fields="files(id,name,modifiedTime)",
+            pageSize=100,
+            orderBy="modifiedTime desc",
+        ).execute()
+    except Exception as exc:
+        log(f"could not list Drive: {describe(exc)}")
+        return [], 1
+
+    folder_id = None
+    items = []
+    for row in listed.get("files", []):
+        name = row.get("name", "")
+        # Only files shaped like a Recorder export. Everything else in root is
+        # someone's actual document and none of this bridge's business.
+        if not RECORDER_TITLE_RE.match(name.strip()):
+            continue
+        try:
+            text = service.files().export(fileId=row["id"], mimeType="text/plain").execute()
+        except Exception as exc:
+            log(f"could not read {name!r} from Drive: {describe(exc)}")
+            continue
+        if isinstance(text, bytes):
+            text = text.decode("utf-8", "replace")
+
+        updated = None
+        try:
+            updated = datetime.fromisoformat(row["modifiedTime"].replace("Z", "+00:00"))
+        except (KeyError, ValueError):
+            pass
+
+        if folder_id is None:
+            folder_id = _captured_folder(service) or ""
+
+        file_id = row["id"]
+
+        def file_away(fid=file_id, label=name):
+            if not folder_id:
+                return
+            try:
+                service.files().update(
+                    fileId=fid, addParents=folder_id, removeParents="root", fields="id"
+                ).execute()
+            except Exception as exc:
+                # The row exists either way; tidying is best effort.
+                log(f"captured {label!r} but could not move it: {exc}")
+
+        items.append(
+            Item(
+                source="drive",
+                uid=f"drive::{file_id}",
+                title=name.strip()[:TITLE_LIMIT],
+                text=(text or "").strip(),
+                updated=updated,
+                origin="Drive",
+                on_captured=file_away,
+            )
+        )
+    return items, 0
+
+
 def gather(sources, since) -> tuple[list, int]:
     items, problems = [], 0
     for name in sources:
-        got, bad = (keep_items if name == "keep" else applenotes_items)(since)
+        reader = {"keep": keep_items, "applenotes": applenotes_items, "drive": drive_items}[name]
+        got, bad = reader(since)
         items += got
         problems += bad
     return items, problems
@@ -491,6 +663,10 @@ def sync_items(items, client, state, args, budget) -> tuple[int, int, int]:
         if budget is not None:
             budget[0] -= 1
         log(f"{where}: created row for {item.title!r}")
+        # Only after the row exists and is recorded -- tidying must never run
+        # for something that failed to land in Notion.
+        if item.on_captured:
+            item.on_captured()
 
     return created, skipped_edited, failed
 
@@ -582,6 +758,14 @@ def check(args) -> int:
             )[:3]:
                 stamp = item.updated.astimezone().strftime("%Y-%m-%d %H:%M") if item.updated else "unknown"
                 log(f"    most recent: {stamp}  {item.title!r}")
+
+    if "drive" in args.sources:
+        items, bad = drive_items(args.since)
+        problems += bad
+        if not bad:
+            log(f"Drive: authorised, {len(items)} Recorder transcript(s) in the window")
+            for item in items[:3]:
+                log(f"    {item.title!r}")
 
     notion_token = env("NOTION_TOKEN").strip()
     if not notion_token:

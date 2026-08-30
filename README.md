@@ -1,13 +1,49 @@
 # Capture bridge → Notion
 
-The capture leg of the daily OS. Notes from **Google Keep** and **Apple Notes**
-land automatically as rows in the **📥 Notes Inbox** Notion database, no taps.
+The capture leg of the daily OS. Notes from **Google Keep**, **Apple Notes**
+and **Recorder transcripts shared to Drive** land automatically as rows in the
+**📥 Notes Inbox** Notion database.
 A separate system sweeps that Inbox and files them; this bridge does not.
 
 One way, into Notion. This code never modifies a note at either source.
 
-Rows carry `Source = Keep` or `Source = Apple Notes`. Run all sources (the
-default) or one at a time with `--source keep` / `--source applenotes`.
+Rows carry `Source = Keep`, `Apple Notes` or `Recorder`. Run all sources (the
+default) or one at a time with `--source keep|applenotes|drive`.
+
+## Recorder, via Drive
+
+Recorder shares a transcript as a Google Doc in My Drive root, named like
+`Aug 29 at 4:43 PM`. Only files matching that shape are read -- everything else
+in your root is someone's actual document and none of this bridge's business.
+Once a transcript has a row in Notion it is moved into a **Recorder Captured**
+folder, so root stays clean and nothing is rescanned. A transcript whose row
+failed is left where it is on purpose, to be retried next run.
+
+### Authorising Drive
+
+Unlike Keep, this needs real OAuth. Once:
+
+1. <https://console.cloud.google.com> -- create a project (any name).
+2. APIs & Services -> Library -> enable **Google Drive API**.
+3. APIs & Services -> OAuth consent screen -> External, add yourself as a test user.
+4. Credentials -> Create credentials -> **OAuth client ID** -> *Desktop app*.
+5. Download the JSON, save it beside `sync.py` as `credentials.json`.
+6. Run once from Terminal, which opens a browser for consent:
+
+```sh
+python sync.py --source drive --dry-run
+```
+
+That writes `drive_token.json` (mode `600`) and refreshes itself thereafter.
+Scheduled runs never attempt consent -- without a token they say so and carry
+on, because launchd has nobody to answer a browser prompt.
+
+Needs two libraries: `pip install google-api-python-client google-auth-oauthlib`.
+
+**Scope note:** moving captured files needs Drive's read/write scope, so the
+stored token can read and modify that Drive. It stays on this machine and is
+gitignored. A read-only scope would do if you would rather transcripts were
+left in place -- say so and the file-away step comes out.
 
 ## Apple Notes
 
