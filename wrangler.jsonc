@@ -1,0 +1,10 @@
+{
+  // Static-only Worker: no script entry point, so requests are served
+  // straight from Cloudflare's asset path. The site is plain HTML in /site,
+  // so there is no build step — Workers Builds just runs `npx wrangler deploy`.
+  "name": "receipts",
+  "compatibility_date": "2026-08-30",
+  "assets": {
+    "directory": "./site"
+  }
+}
